@@ -1,0 +1,1048 @@
+---
+title: "YKKY0081"
+author: "GuoHao"
+date: "2024/3/6"
+output: html_document
+---
+
+## R Package loading
+
+```{r load.package, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages(library(EPARS))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(openxlsx))
+suppressPackageStartupMessages(library(RColorBrewer))
+suppressPackageStartupMessages(library(corrplot))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(ggpubr))
+suppressPackageStartupMessages(library(limma))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(pryr))
+suppressPackageStartupMessages(library(tidyHeatmap))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(kableExtra))
+suppressPackageStartupMessages(library(DT))
+suppressPackageStartupMessages(library(clusterProfiler))
+suppressPackageStartupMessages(library(org.Hs.eg.db))
+suppressPackageStartupMessages(library(Hmisc))
+suppressPackageStartupMessages(library(base64enc))
+suppressPackageStartupMessages(library(R.utils))
+suppressPackageStartupMessages(library(plotly))
+suppressPackageStartupMessages(library(stringr))
+suppressPackageStartupMessages(library(RColorBrewer))
+suppressPackageStartupMessages(library(corrplot))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(ggpubr))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(ggthemes))
+suppressPackageStartupMessages(library(ggsci))
+suppressPackageStartupMessages(library(survival))
+suppressPackageStartupMessages(library(survminer))
+suppressPackageStartupMessages(library(CellChat))
+suppressPackageStartupMessages(library(patchwork))
+setwd("~/work/DSP/YKKY0081天津胸科医院/DSP_WTA")
+# default parameter
+Work_canche_dir <- "./personal_analysis/rmd_Results/"
+Work_plot_dir<- "./personal_analysis/rmd_Results/"
+```
+
+## Creat Function
+
+```{r set.the.function}
+gh.subset <- function(object, patter) {
+  object@anno <- object@anno %>%
+    dplyr::filter({{ patter }})
+  object@exp <- object@exp %>%
+    as.data.frame() %>%
+    dplyr::select(rownames(object@anno)) %>%
+    as.matrix()
+  return(object)
+}
+
+heatmap.function <- function(object, PlotsPath, i) {
+  exp_group_object_single <- object
+  exp_group_object_single@heatmap_groups <- c("CancerType", "Sample")
+  exp_group_object_single <- epars_plot_setting(exp_group_object_single)
+  exp_group_object_single <- epars_heatmap_anno_data(exp_group_object_single)
+  rownames(exp_group_object_single@plot_setting$group_df) <- rownames(exp_group_object_single@anno)
+  # group_df_order = order(exp_group_object_single@plot_setting$group_df[,1])
+  # ordered_sample <- rownames(exp_group_object_single@plot_setting$group_df)[group_df_order]
+  FigWidth <- 0.1 * nrow(exp_group_object@anno) + 3
+  # 配置单分组的显示样式
+  heat_mat <- htmp_scale(exp_group_object_single@exp)
+  p <- Heatmap(heat_mat,
+    show_column_names = FALSE,
+    show_row_names = FALSE,
+    heatmap_legend_param = list(title = "", legend_height = unit(4, "cm")),
+    # column_order = ordered_sample,
+    column_names_rot = -90,
+    row_names_gp = gpar(fontsize = 4),
+    column_names_gp = gpar(fontsize = 5),
+    clustering_method_rows = "ward.D2",
+    name = "Scale(exp)",
+    cluster_column_slices = F,
+    cluster_rows = T,
+    cluster_columns = T,
+    # column_split = exp_group_object_single@plot_setting$group_df,
+    column_title = paste0(ncol(heat_mat), " ", i, "-AOIs"),
+    column_title_side = "bottom",
+    column_title_gp = gpar(fontsize = 15),
+    heatmap_width = unit(5, "npc"),
+    heatmap_height = unit(7, "npc"),
+    clustering_method_columns = "ward.D2",
+    top_annotation = exp_group_object_single@plot_setting$heatmap_anno,
+    col = exp_group_object@config$heatmap_color
+  )
+  suppressMessages(save_pdf(p, PlotsPath, width = FigWidth))
+}
+
+ghboxplt <- function(data, patter) {
+  data %>%
+    dplyr::filter(Marker_names == {{ patter }}) %>%
+    ggboxplot(
+      x = "CancerType",
+      y = "Marker_value",
+      fill = "Morphology",
+      ylab = paste0(patter, " Value")
+    ) +
+    ggsci::scale_fill_aaas()
+}
+
+List2ggupset <- function(list) {
+  gene_pathway_membership <- fromList(list) %>%
+    apply(2, as.logical)
+  rownames(gene_pathway_membership) <- unique(unlist(list))
+
+  tidy_pathway_member <- gene_pathway_membership %>%
+    t() %>%
+    as_tibble(rownames = "Pathway") %>%
+    gather(Gene, Member, -Pathway) %>%
+    filter(Member) %>%
+    select(-Member) %>%
+    group_by(Gene) %>%
+    summarise(Pathways = list(Pathway))
+  return(tidy_pathway_member)
+}
+
+upset.plot <- function(data, ...) {
+  p <- data %>%
+    ggplot(aes(x = Pathways)) +
+    geom_bar() +
+    scale_x_upset(
+      order_by = "degree",
+      reverse = T,
+    ) +
+    geom_text(stat = "count", aes(label = after_stat(count)), vjust = -1) +
+    # scale_y_continuous(name = "Intersection size",expand = c(0, 0), limits = c(0, 6))+
+    # theme(text = element_text(family = "ARIAL", colour = "black", size = 9))+
+    xlab("") +
+    theme_combmatrix(
+      # combmatrix.label.text = element_text(family = "ARIAL", colour = "black", size = 9),
+    ) +
+    theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+    theme(
+      panel.background = element_blank(),
+      axis.text.y = element_text(size = 9)
+    ) +
+    ggtitle("Differential genes (control:case)")
+  return(p)
+}
+
+enrichKEGG.function <- function(gene, qvalueCutoff = 1, pvalueCutoff = 1) {
+  gene <- tranSymbol(gene)
+  enr <- enrichKEGG(gene$ENTREZID, pvalueCutoff = pvalueCutoff, qvalueCutoff = qvalueCutoff)
+  return(enr)
+}
+
+trans2num <- function(Ratio) {
+  fractions <- sapply(strsplit(Ratio, "/"), as.integer)
+  numeric_values <- fractions[1, ] / fractions[2, ]
+  numeric_values <- round(numeric_values, digits = 2)
+  return(numeric_values)
+}
+
+dotplot.function <- function(data) {
+  p <- data %>%
+    ggplot(aes(x = Group, y = Description)) +
+    geom_point(aes(size = GeneRatio, color = p.adjust)) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      # axis.line = element_line(colour = "black", linewidth = 1),
+      panel.border = element_rect(color = "black", linewidth = 1, fill = NA),
+      panel.grid.major = element_line(colour = "lightgrey")
+    )
+  return(p)
+}
+
+nordata <- function(data) {
+  return(data / sum(data))
+}
+output_intersection <- function(intersecion_set, file){
+  intersecion_set$Pathways <- as.character(intersecion_set$Pathways)
+  intersecion_set <- split(intersecion_set, intersecion_set$Pathways) %>% 
+    lapply(\(.x) dplyr::select(.x, Gene))
+  names(intersecion_set) <-
+    names(intersecion_set) %>% 
+    gsub("c\\(", "", .) %>% 
+    gsub(":", "vs", .) %>% 
+    str_extract_all("\\((.*?)\\)") %>% 
+    lapply(\(.x) paste0(.x, collapse = "_")) %>% 
+    gsub("\\(|\\)", "", .) 
+  intersecion_set <- lapply(names(intersecion_set), \(.x){
+    intersecion_set[[.x]] <- intersecion_set[[.x]] %>% 
+      dplyr::mutate(Group = .x)
+  }) %>% 
+    do.call(rbind, .)
+  write.xlsx(intersecion_set, file = file)
+  return(intersecion_set)
+  
+}
+```
+
+## 样本信息
+
+### 分组
+
+Group1: 
+Group2: 
+
+```{r del.the.sample}
+## load the raw data, the data neet to del the sample
+load("./results/rendering_cache_DSP_CTA/data-readin_3dab01df010760cdad434e6c2cae1f1c.RData")
+exp_group_object@anno <- exp_group_object@anno %>%
+  dplyr::filter(rownames(.) != "23R3921.3843.7918SLZA_007_Full")
+exp_group_object@exp <- exp_group_object@exp %>%
+  as.data.frame() %>%
+  dplyr::select(-`23R3921.3843.7918SLZA_007_Full`) %>%
+  as.matrix()
+exp_group_object@anno <- exp_group_object@anno %>%
+  mutate(Sample = TMA.position)
+saveRDS(exp_group_object, file = "./personal_analysis/rmd_Results/exp_group_object.RDs")
+rm(list = ls())
+```
+
+## Part I of the article
+
+### 1.1 dimensionality reduction
+
+#### Integral dimension reduction
+
+```{r integral.Integral.dimension, warning=FALSE}
+exp_group_object <- readRDS("./personal_analysis/rmd_Results/exp_group_object.RDs")
+CachePath <- paste0(Work_canche_dir, "Part I/1.1 dimensionality reduction/integral level/")
+PlotsPath <- paste0(Work_canche_dir, "Part I/1.1 dimensionality reduction/integral level/")
+create_dir(path.list = c(CachePath, PlotsPath))
+exp_group_object@heatmap_groups <- c("Morphology", "TNM", "CancerType", "Prognosis", "Sample")
+exp_group_object <- PCA_plot(exp_group_object,
+  CachePath = CachePath,
+  group = exp_group_object@heatmap_groups,
+  color_palette = exp_group_object@config$pan_color,
+  template = "", space = " ",
+  prefix = "PCA"
+)
+exp_group_object <- tSNE_plot(exp_group_object,
+  CachePath = CachePath,
+  group = exp_group_object@heatmap_groups,
+  color_palette = exp_group_object@config$pan_color,
+  template = "", space = "",
+  prefix = "tSNE"
+)
+exp_group_object <- UMAP_plot(exp_group_object,
+  CachePath = CachePath,
+  group = exp_group_object@heatmap_groups,
+  color_palette = exp_group_object@config$pan_color,
+  template = "", space = "",
+  prefix = "UMAP"
+)
+```
+
+#### Group1 降维
+
+```{r Group1}
+CachePath <- paste0(Work_canche_dir, "Part I/1.1 dimensionality reduction/Group1/placeholder/")
+PlotsPath <- paste0(Work_canche_dir, "Part I/1.1 dimensionality reduction/Group1/placeholder/")
+for (i in unique(exp_group_object@anno$Morphology)) {
+  CachePath <- sub("[/][^/]+$", paste0("/", i, "/"), gsub("[/]$", "", CachePath))
+  PlotsPath <- sub("[/][^/]+$", paste0("/", i, "/"), gsub("[/]$", "", PlotsPath))
+  # print(CachePath)
+  create_dir(path.list = c(CachePath, PlotsPath))
+  object <- exp_group_object %>%
+    gh.subset(Morphology == i)
+  object@heatmap_groups <- c("CancerType")
+  object <- PCA_plot(object,
+    CachePath = CachePath,
+    group = object@heatmap_groups,
+    color_palette = object@config$pan_color,
+    template = "", space = " ",
+    prefix = paste0("PCA_", i)
+  )
+  object <- tSNE_plot(object,
+    CachePath = CachePath,
+    group = object@heatmap_groups,
+    color_palette = object@config$pan_color,
+    template = "", space = "",
+    prefix = paste0("tSNE_", i)
+  )
+  object <- UMAP_plot(object,
+    CachePath = CachePath,
+    group = object@heatmap_groups, n_neighbors = 6,
+    color_palette = object@config$pan_color,
+    template = "", space = "",
+    prefix = paste0("UMAP_", i)
+  )
+  rm(object)
+}
+### point 5
+CachePath <- paste0(Work_canche_dir, "Part I/1.1 dimensionality reduction/Group1/CancerType/placeholder/")
+PlotsPath <- paste0(Work_canche_dir, "Part I/1.1 dimensionality reduction/Group1/CancerType/placeholder/")
+# create_dir(path.list = c(CachePath,PlotsPath))
+for (i in unique(exp_group_object@anno$CancerType)) {
+  CachePath <- sub("[/][^/]+$", paste0("/", i, "/"), gsub("[/]$", "", CachePath))
+  PlotsPath <- sub("[/][^/]+$", paste0("/", i, "/"), gsub("[/]$", "", PlotsPath))
+  # print(CachePath)
+  create_dir(path.list = c(CachePath, PlotsPath))
+  object <- exp_group_object %>%
+    gh.subset(CancerType == i)
+  object@heatmap_groups <- c("Prognosis")
+  object <- PCA_plot(object,
+    CachePath = CachePath,
+    group = object@heatmap_groups,
+    color_palette = object@config$pan_color,
+    template = "", space = " ",
+    prefix = paste0("PCA_", i)
+  )
+  object <- tSNE_plot(object,
+    CachePath = CachePath,
+    group = object@heatmap_groups,
+    color_palette = object@config$pan_color,
+    template = "", space = "",
+    prefix = paste0("tSNE_", i)
+  )
+  object <- UMAP_plot(object,
+    CachePath = CachePath,
+    group = object@heatmap_groups, n_neighbors = 6,
+    color_palette = object@config$pan_color,
+    template = "", space = "",
+    prefix = paste0("UMAP_", i)
+  )
+  rm(object)
+}
+```
+
+#### Group2 降维
+
+```{r Group2 }
+CachePath <- paste0(Work_canche_dir, "Part I/1.1 dimensionality reduction/Group2/")
+PlotsPath <- paste0(Work_canche_dir, "Part I/1.1 dimensionality reduction/Group2/")
+create_dir(path.list = c(CachePath, PlotsPath))
+for (i in unique(exp_group_object@anno$Morphology)) {
+  object <- exp_group_object %>% 
+    gh.subset(Morphology == i)
+  object@heatmap_groups <- c("Prognosis")  
+  object <- PCA_plot(object, CachePath = CachePath,
+                     group = object@heatmap_groups, 
+                     color_palette = object@config$pan_color,
+                     template = "", space = " ",
+                     prefix = paste0("PCA_", i))
+  object <- tSNE_plot(object, CachePath = CachePath,
+                      group = object@heatmap_groups,
+                      color_palette = object@config$pan_color,
+                      template = "", space = "",
+                      prefix = paste0("tSNE_", i))
+  object <- UMAP_plot(object, CachePath = CachePath,
+                      group = object@heatmap_groups, n_neighbors = 6,
+                      color_palette = object@config$pan_color,
+                      template = "", space = "",
+                      prefix = paste0("UMAP_", i))
+  rm(object)
+} 
+```
+
+### 1.2 Overview HeatMap
+
+```{r Overview_Heatmap}
+CachePath <- paste0(Work_canche_dir, "Part I/1.2 Overview Heatmap/")
+PlotsPath <- paste0(Work_canche_dir, "Part I/1.2 Overview Heatmap/")
+create_dir(path.list = c(CachePath, PlotsPath))
+exp_group_object_single <- exp_group_object
+# exp_group_object_single@exp %>% rownames() %>% grep(pattern = "WTX", value = T)
+exp_group_object_single@exp <- exp_group_object_single@exp %>% 
+  as.data.frame() %>% 
+  dplyr::filter(!grepl("WTX", rownames(.))) %>% 
+    as.matrix()
+
+for (i in unique(exp_group_object@anno$Morphology)) {
+  object <- exp_group_object_single %>% 
+    gh.subset(Morphology == i)
+  # debug(heatmap.function)
+  heatmap.function(object, paste0(PlotsPath, "_", i, ".pdf"), i)
+}
+rm(exp_group_object_single)
+```
+
+### 1.3 Mark gene expression
+
+```{r Mark gene expression}
+CachePath <- paste0(Work_canche_dir, "Part I/1.3 Mark gene expression/")
+PlotsPath <- paste0(Work_canche_dir, "Part I/1.3 Mark gene expression/")
+create_dir(path.list = c(CachePath, PlotsPath))
+
+panck.marker <- c("KRT1", "KRT5", "KRT8", "KRT14", "KRT19")
+plotdata <- exp_group_object@exp %>% 
+  as.data.frame() %>% 
+  dplyr::filter(rownames(.) %in% c(panck.marker, "CD68", "CD163")) %>% 
+  t %>% 
+  as.data.frame() %>% 
+  merge(exp_group_object@anno %>% 
+          dplyr::select(Morphology, Sample, CancerType), by = 0, sort = F) %>% 
+  rename(SampleID = Row.names) %>% 
+  mutate(PanCK = (KRT8+KRT19)/2) %>% # 只能找到这两个基因, 大抵是呗过滤掉了
+  dplyr::select(-KRT19, -KRT8) %>% 
+  dplyr::select(1, 4, 5, 6, everything()) %>% 
+  pivot_longer(cols = -colnames(.)[1:4], names_to = "Marker_names", values_to = "Marker_value")
+
+lapply(unique(plotdata$Marker_names), function(.x){
+  p <- ghboxplt(plotdata, .x)
+  ggsave(p, filename = paste0(PlotsPath, .x, "boxplot.pdf"))
+})
+```
+
+## Part II of the article
+
+### 2.1 Search for lung tumor markers in epithelial cells
+
+首先进行差异基因的计算, 将所有的亚型跟最恶性程度最低的亚型LPA相比, 寻找差异基因, 并取交集.
+
+这里一并计算了M1/M2中的差异基因备用. 本部分筛选仍使用上皮细胞相关的数据.
+
+没有找到再多个差异分组中都显著的基因, 也没有找到随着恶性程度上升表达量上升的基因, 随之下降的也没有.
+
+```{r DEG}
+CachePath <- paste0(Work_canche_dir, "Part II/2.1 differential gene/")
+PlotsPath <- paste0(Work_canche_dir, "Part II/2.1 differential gene/")
+create_dir(path.list = c(CachePath, PlotsPath))
+exp_group_object@deg_groups <- c("CancerType(LPA:PPA),Prognosis$bad&Morphology$M1; CancerType(LPA:CAA),Prognosis$bad&Morphology$M1; CancerType(LPA:SPA),Prognosis$bad&Morphology$M1; CancerType(LPA:MPA),Prognosis$bad&Morphology$M1; CancerType(LPA:APA),Prognosis$bad&Morphology$M2; CancerType(LPA:CAA),Prognosis$bad&Morphology$M2; CancerType(LPA:SPA),Prognosis$bad&Morphology$M2; CancerType(LPA:MPA),Prognosis$bad&Morphology$M2; CancerType(LPA:APA),Prognosis$bad&Morphology$TC; CancerType(LPA:PPA),Prognosis$bad&Morphology$TC; CancerType(LPA:CAA),Prognosis$bad&Morphology$TC; CancerType(LPA:SPA),Prognosis$bad&Morphology$TC; CancerType(LPA:MPA),Prognosis$bad&Morphology$TC")
+
+source("~/script/Rscript/Parallel script/library_EPARS_parallel.r")
+exp_group_object <- parallel_DEG(exp_group_object, CachePath = "./personal_analysis/rmd_Results/Part II/2.1 differential gene/DEG_res/", core.num = 6)
+
+parallel_heatmap(exp_group_object, CachePath = "./personal_analysis/rmd_Results/Part II/2.1 differential gene/DEG_res/heatmap//", PlotsPath = "./personal_analysis/rmd_Results/Part II/2.1 differential gene/DEG_res/heatmap//", core.num = 6)
+
+parallel_volcano(exp_group_object, PlotsPath = "./personal_analysis/rmd_Results/Part II/2.1 differential gene/DEG_res/volcano_lplot/")
+
+
+exp_list <- exp_group_object@deg %>% 
+  lapply(\(.x){.x@result_df}) %>% 
+  lapply(\(.x){
+    .x %>% dplyr::filter(change != "NOT") %>% rownames()
+  }) %>% 
+  .[sapply(., \(.x) length(.x) != 0)] %>% 
+  .[!grepl("^Pro", names(.))]
+
+DEG_list <- list(M1_list =  exp_list[names(exp_list) %>% grep(patter = "M1", value = T)],
+                 M2_list = exp_list[names(exp_list) %>% grep(patter = "M2", value = T)],
+                 TC_list = exp_list[names(exp_list) %>% grep(patter = "TC", value = T)]) %>% 
+  lapply(\(.x) {
+    names(.x) <- names(.x) %>% str_extract(".*(?=\\,)")
+    return(.x)
+  })
+
+## 单独取TC的差异基因计算交集
+Reduce(intersect, DEG_list$TC_list) # 没有在各个组内都有的基因
+```
+
+#### 2.1.1 Upset
+
+由于差异没有什么交集结果, 准备利用upset图来看看, 有哪些群之间有交集
+
+```{r Upset}
+library(UpSetR)
+library(ComplexUpset)
+library(ggupset)
+names(DEG_list$TC_list)
+lapply(names(DEG_list), \(.x){
+  dir <- paste0(Work_plot_dir, "Part II/2.1 differential gene/2.1.1 UPset_plot/", .x, "/")
+  dir.create(dir, recursive = T, showWarnings = F)
+  data <- DEG_list[[.x]]
+  intersecion_set <- List2ggupset(data)
+  output_intersection(intersecion_set, file = paste0(dir, "instersection_gene.xlsx"))
+  p <- upset.plot(intersecion_set)
+  ggsave(plot = p, filename = paste0(dir, "upset_plot.pdf"), height = 9, width = 16)
+})
+```
+
+通过upset图可以看到, ***CDC25B*****,** ***CH25H***, ***SMAD1*** 是在三个亚型中共有的差异基因, 因此绘制折线图呈现这三个基因的表达趋势,
+
+发现这三个基因会在除SPA, MPA的亚型中是上升趋势.
+
+```{r 3gene boxplot}
+exp <- exp_group_object@exp %>% 
+  as.data.frame() %>% 
+  filter(rownames(.) %in% c("CDC25B", "CH25H", "SMAD1")) %>% t
+exp <- merge(anno, exp, by = 0) %>%
+  dplyr::select(-1) %>% 
+  summarise(across(everything(), mean), .by = CancerType) %>% 
+  pivot_longer(cols = -CancerType)  
+exp$CancerType <- factor(exp$CancerType, levels = time.point)
+p <- ggline(exp, x = "CancerType", y = "value", color = "name") 
+ggsave(filename = paste0(Work_plot_dir, "Part II/3_gene.pdf"), plot = p)
+```
+
+由此得到, 是否SPA和MPA中基因总体表达是变低的?
+
+```{r all_gene_boxplot}
+exp <- exp_group_object@exp %>% 
+  as.data.frame() %>% t 
+exp <- merge(anno, exp, by = 0) %>%
+  dplyr::select(-1) %>% 
+  summarise(across(everything(), mean), .by = CancerType) %>% 
+  pivot_longer(cols = -CancerType)
+exp <- exp %>% 
+  mutate(value2 = log2(value))
+exp$CancerType <- factor(exp$CancerType, levels = time.point)
+p <- ggboxplot(exp, x = "CancerType", y = "value2")
+ggsave(filename = paste0(Work_plot_dir, "Part II/all_gene_boxplot.pdf"), plot = p)
+```
+
+发现确实两个亚型的整体基因表达是较低的.
+
+因此建议去掉这两个亚型看是否有什么发现
+
+### 2.2 Enrichment analysis
+
+富集分析同样没有发现共有的通路, 但是还是按照要求分析一遍
+
+```{r Enrichment analysis}
+CachePath <- paste0(Work_canche_dir, "Part II/2.2 Enrichment analysis/")
+PlotsPath <- paste0(Work_canche_dir, "Part II/2.2 Enrichment analysis/")
+create_dir(path.list = c(CachePath, PlotsPath))
+enrichment.res_list <- lapply(DEG_list, function(.x){
+ .x <- lapply(.x, \(..x){
+    enrichKEGG.function(..x, qvalueCutoff = 1, pvalueCutoff = 1) %>% 
+     as.data.frame()
+  })
+})
+saveRDS(enrichment.res_list, paste0(CachePath, "enrichment.res.RDs"))
+enrichment.res_list <- readRDS("~/work/DSP/YKKY0081天津胸科医院/DSP_WTA/personal_analysis/rmd_Results/Part II/2.2 Enrichment analysis/enrichment.res.RDs")
+TC_enrich_res <- enrichment.res_list$TC_list %>% 
+  lapply(\(.x) {
+    .x <- .x %>% dplyr::filter(pvalue < 0.05)
+    .x <- .x$ID
+  }) %>% Reduce(append, .) %>% unique()
+
+plot.data <- enrichment.res_list %>% 
+  lapply(\(.x){
+    .x <- .x %>% 
+      do.call(rbind, .) %>% 
+      rownames_to_column("Group") %>% 
+      mutate(Group = str_extract(Group, ".*(?=\\.)")) %>% 
+      group_by(Group) %>% # 保存表格注释掉
+      slice_min(p.adjust, n = 5) %>% # 这里取了每个组中矫正p值前5位 # 保存表格注释掉
+      # 在画图之前, 先保存字符形式的Ratio
+      mutate(GeneRatio = trans2num(GeneRatio), BgRatio = trans2num(BgRatio)) # 保存表格注释掉
+    return(.x)
+  })
+write.xlsx(plot.data, 
+           file = paste0(CachePath, "enrichment.results.xlsx"),
+           overwrite = T)
+lapply(names(plot.data), function(.x){
+  print(.x)
+  dir <- paste0(CachePath, .x, "/")
+  dir.create(dir, recursive = T)
+  p <- dotplot.function(plot.data[[.x]])
+  ggsave(filename = paste0(dir, "dotplot.pdf"), height = 20, width = 10, plot = p)
+})
+
+```
+
+### 2.3 Use SCORPIUS to simulate developmental trajectories
+
+看起来也没有什么趋势
+
+```{r SCORPIUS}
+library(SCORPIUS)
+group_names <- exp_group_object@anno %>% 
+  dplyr::select(CancerType)
+exp <- merge(group_names, exp_group_object@exp %>% t, by = 0) %>% 
+  dplyr::select(-1,-2) %>% 
+  as.matrix()
+group_names <- group_names$CancerType %>% factor(levels = time.point)
+space <- reduce_dimensionality(exp, "spearman")
+draw_trajectory_plot(space, group_names, contour = TRUE)
+traj <- infer_trajectory(space)
+p <- draw_trajectory_plot(space, group_names, traj$path, contour = TRUE)
+ggsave(filename = paste0(Work_plot_dir, "Part II/2.3 SCORPIUS/developmental trajectories.pdf"), plot = p)
+```
+
+## Part III Overall description of immune cells
+
+### 3.1 SpatialDecon immune cells
+
+```{r SpatialDecon}
+CachePath <- paste0(Work_canche_dir, "Part III/")
+PlotsPath <- paste0(Work_canche_dir, "Part III/")
+create_dir(path.list = c(CachePath, PlotsPath))
+library(SpatialDecon)
+per.observation.mean.neg <- exp_group_object@exp["NegProbe-WTX", ]
+bg <-  sweep(exp_group_object@exp * 0, 2, per.observation.mean.neg, "+")
+bg2 <- derive_GeoMx_background(norm = exp_group_object@exp,
+                               probepool = rep(1, nrow(exp_group_object@exp)),
+                               negnames = "NegProbe-WTX")
+res <- spatialdecon(norm = exp_group_object@exp, bg = bg, X = safeTME,
+                    cell_counts = exp_group_object@anno$AOINucleiCount,
+                    # cellmerges = safeTME.matches, # 是否合并成大类
+                    # is_pure_tumor = object@anno$Tumor == "TRUE",
+                    align_genes = TRUE)
+write.xlsx(res$beta %>% as.data.frame(),
+           file = paste0(CachePath, "3.1 immune cells/spatialdecon.res.abundance.xlsx"), 
+           rowNames = T)
+
+```
+
+```{r plot}
+exp_group_object@heatmap_groups <- c("CancerType", "SegmentLabel")
+exp_group_object@anno$CancerType <- factor(exp_group_object@anno$CancerType)
+exp_group_object@anno$SegmentLabel <- factor(exp_group_object@anno$SegmentLabel)
+exp_group_object <- epars_plot_setting(exp_group_object)
+exp_group_object <- epars_heatmap_anno_data(exp_group_object)
+ordersample <- rownames(arrange(exp_group_object@anno, CancerType))
+# abundance 
+p <- Heatmap(matrix = res$beta %>% scale(), 
+        top_annotation = exp_group_object@plot_setting$heatmap_anno, 
+        cluster_columns = F, column_order = ordersample,
+        heatmap_legend_param = list(title = "",legend_height = unit(4, "cm")),
+        column_split = exp_group_object@plot_setting$group_df[, "SegmentLabel"])
+save_pdf(p, 
+         filename = paste0(CachePath, "3.1 immune cells//SpatialDecon.immcell.abundance.heatmap.pdf"), 
+         height = 12, width = 12)
+Cancertype.abundance <- res$beta %>% 
+  as.data.frame() %>% 
+  t() %>% 
+  merge(exp_group_object@anno %>% dplyr::select(CancerType), ., by = 0) %>% 
+  column_to_rownames("Row.names") %>% 
+  group_by(CancerType) %>% 
+  summarise(across(everything(), sum)) %>% 
+  column_to_rownames("CancerType") %>% 
+  apply(1, \(.x) .x/sum(.x)) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("CellType") %>% 
+  pivot_longer(cols = -CellType, names_to = "CancerType", values_to = "Cell.Proportion")
+suppressPackageStartupMessages(library(RColorBrewer))
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+p <- Cancertype.abundance %>% 
+  ggplot(aes(x = CancerType, y = Cell.Proportion)) + 
+  geom_col(aes(fill = CellType)) + 
+  scale_fill_manual(values = col_vector) + 
+  ylab("Cell Proportion")
+ggsave(plot = p, filename = paste0(CachePath,"3.1 immune cells/SpatialDecon.immcell.proportion.pdf"), 
+       height = 12, width = 12)
+#### 
+# 经过检查, monocytes.C 这个在某些亚型中丰度为0
+#### 
+
+#### immcell abundance boxplot ####
+plotdata <- res$beta %>% 
+  as.data.frame() %>% 
+  t() %>% 
+  merge(exp_group_object@anno %>% dplyr::select(CancerType), ., by = 0) %>% 
+  dplyr::select(-monocytes.C)
+
+plotdata$CancerType <- plotdata$CancerType %>% as.character()
+source("~/script/Rscript/all.function.R")
+
+adjusted_boxplot_nojitter(input_df = plotdata, 
+                          id_colnames = colnames(plotdata)[1:2], 
+                          x_aes = colnames(plotdata)[2], 
+                          plot_dir = paste0(CachePath, "3.1 immune cells/boxplot/"),
+                          plot_suffix = ".abundance.boxplot.pdf", 
+                          comparisons_list = combn(unique(plotdata$CancerType), 2, simplify = F), 
+                          x_order = unique(plotdata$CancerType), 
+                          plot_width = 25, 
+                          ncol = 6,
+                          # stat_method = "t.test", 
+                          adjust_method = "BH")
+```
+
+### 3.3 Cibersort
+
+为了探究M1-2的比例, 这里使用cibersort进行计算.
+
+```{r cibersort}
+source("~/script/Rscript/Cibersort/CIBERSORT.R")
+Cibersort.result <- CIBERSORT(sig_matrix = readRDS("~/script/Rscript/Cibersort/LM22.rds"), 
+                              mixture_file = exp_group_object@exp,
+                              perm = 1000,
+                              QN = FALSE, 
+                              absolute = T)
+write.xlsx(Cibersort.result %>% as.data.frame(), 
+           file = paste0(CachePath, "3.3 Cibersort/Cibersort.res.absolut.xlsx"), rowNames = T)
+
+Macrophages.cell <- Cibersort.result %>% 
+  as.data.frame() %>% 
+  dplyr::select(starts_with("Macrophages")) %>% 
+  merge(., exp_group_object@anno %>% dplyr::select(CancerType), by = 0) %>% 
+  dplyr::rename(SampleID = Row.names) %>% 
+  dplyr::group_by(CancerType) %>% 
+  dplyr::summarise(M0 = sum(`Macrophages M0`), 
+            M1 = sum(`Macrophages M1`), 
+            M2 = sum(`Macrophages M2`)) %>% 
+  column_to_rownames("CancerType") %>% 
+  apply(1, \(.x) .x/sum(.x)) %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("CancerType") %>% 
+  pivot_longer(cols = -CancerType, names_to = "Macrophages", values_to = "Proprotion")
+
+p <- Macrophages.cell %>% 
+  ggplot(aes(x = CancerType , y = Proprotion)) + 
+  geom_col(aes(fill = Macrophages))
+
+ggsave(plot = p, filename = paste0(CachePath, "3.3 Cibersort/cibersort.Macrophages.Proportion .pdf"))
+```
+
+## Part IV Macrophage ligand receptor analysis
+
+利用Cellchat进行细胞配受体分析
+
+```{r CellChat}
+CachePath <- paste0(Work_canche_dir, "Part IV/")
+PlotsPath <- paste0(Work_canche_dir, "Part IV/")
+create_dir(path.list = c(CachePath, PlotsPath))
+suppressPackageStartupMessages(library(CellChat))
+suppressPackageStartupMessages(library(patchwork))
+meta.data <- exp_group_object@anno %>% 
+  dplyr::select(cell_type = Morphology) %>% 
+  dplyr::filter(cell_type %in% c("M1", "M2", "TC"))
+
+data.input <- exp_group_object@exp %>%  # data.input need to a martix
+  as.data.frame() %>% 
+  dplyr::select(rownames(meta.data)) %>% 
+  as.matrix()
+
+cellchat_martix <- createCellChat(object = data.input, meta = meta.data, group.by = "cell_type")
+CellChatDB <- CellChatDB.human
+cellchat_martix@DB <- CellChatDB
+cellchat_martix <- subsetData(cellchat_martix)
+cellchat_martix <- identifyOverExpressedGenes(cellchat_martix)
+cellchat_martix <- identifyOverExpressedInteractions(cellchat_martix)
+# execution.time = Sys.time() - ptm
+# print(as.numeric(execution.time, units = "secs"))
+# Compute the communication probability and infer cellular communication network
+cellchat_martix <- computeCommunProb(cellchat_martix, type = "triMean")
+cellchat_martix <- filterCommunication(cellchat_martix, min.cells = 10)
+cellchat_martix <- computeCommunProbPathway(cellchat_martix)
+cellchat_martix <- aggregateNet(cellchat_martix)
+View(subsetCommunication(cellchat_martix))
+saveRDS(cellchat_martix, file = paste0(CachePath, "/cellchat_martix.RDs"))
+
+netAnalysis_contribution(cellchat_martix, signaling = "WNT")
+netVisual_circle(cellchat_martix@net$count,  vertex.weight = as.numeric(table(cellchat_martix@idents)), weight.scale = T)
+p <- netVisual_bubble(cellchat_martix, remove.isolate = F)
+ggsave(paste0(CachePath, "/cellchat.res.dotplot.pdf"), height = 45, width = 9)
+out.xlsx <- ggplot_build(p)
+write.xlsx(out.xlsx$plot$data, file = paste0(CachePath, "/cellchat.res.xlsx"))
+```
+
+## Part V
+
+### 5.1 Analysis of prognostic related markers
+
+```{r DEG_analysis_etc}
+CachePath <- paste0(Work_canche_dir, "Part V/")
+PlotsPath <- paste0(Work_canche_dir, "Part V/")
+create_dir(path.list = c(CachePath, PlotsPath))
+
+deg_group <- c("Prognosis(bad:good),Morphology$M2; Prognosis(bad:good),Morphology$M1; Prognosis(bad:good),Morphology$TC")
+source("~/script/Rscript/Parallel script/library_EPARS_parallel.r")
+exp_group_object@deg_groups <- deg_group
+exp_group_object <- parallel_DEG(exp_group_object, CachePath = "./personal_analysis/rmd_Results/Part V/DEG/", core.num = 3)
+parallel_volcano(exp_group_object, PlotsPath = "./personal_analysis/rmd_Results/Part V/DEG/volcano/")
+parallel_heatmap(exp_group_object, CachePath = "personal_analysis/rmd_Results/Part V/DEG/heatmap/", PlotsPath = "personal_analysis/rmd_Results/Part V/DEG/heatmap/", core.num = 6)
+
+### 预后的差异基因
+exp_list <- exp_group_object@deg %>% 
+  lapply(\(.x){.x@result_df}) %>% 
+  lapply(\(.x){
+    .x %>% dplyr::filter(change != "NOT") %>% rownames()
+  }) %>% 
+  .[sapply(., \(.x) length(.x) != 0)]
+prognosis_DEG_list <- list(M1_list =  exp_list[names(exp_list) %>% grep(patter = "M1", value = T)],
+                        M2_list = exp_list[names(exp_list) %>% grep(patter = "M2", value = T)],
+                        TC_list = exp_list[names(exp_list) %>% grep(patter = "TC", value = T)]) %>% 
+  lapply(\(.x) {
+    names(.x) <- names(.x) %>% str_extract(".*(?=\\,)")
+    return(.x)
+  })
+rm(exp_list)
+
+### 前一步的差异基因
+
+exp_group_object <- readRDS("./personal_analysis/rmd_Results/Part II/2.1 differential gene/DEG_res/exp_group_object.RDS")
+exp_list <- exp_group_object@deg %>% 
+  lapply(\(.x){.x@result_df}) %>% 
+  lapply(\(.x){
+    .x %>% dplyr::filter(change != "NOT") %>% rownames()
+  }) %>% 
+  .[sapply(., \(.x) length(.x) != 0)] %>% 
+  .[!grepl("^Pro", names(.))]
+cancer_DEG_list <- list(M1_list =  exp_list[names(exp_list) %>% grep(patter = "M1", value = T)],
+                 M2_list = exp_list[names(exp_list) %>% grep(patter = "M2", value = T)],
+                 TC_list = exp_list[names(exp_list) %>% grep(patter = "TC", value = T)]) %>% 
+  lapply(\(.x) {
+    names(.x) <- names(.x) %>% str_extract(".*(?=\\,)")
+    return(.x)
+  })
+rm(exp_list)
+
+# intersect(cancer_DEG_list$TC_list[[2]], prognosis_DEG_list$TC_list[[1]])
+
+lapply(names(cancer_DEG_list$TC_list), \(.x) {
+  intersect(cancer_DEG_list$TC_list[[.x]], prognosis_DEG_list$TC_list[[1]])
+}) -> Tcell_intersect_gene
+names(Tcell_intersect_gene) <- names(cancer_DEG_list$TC_list)
+
+
+all_intersect_gene <- lapply(names(cancer_DEG_list), \(.x){
+  ca <- cancer_DEG_list[[.x]]
+  pro <- prognosis_DEG_list[[.x]]
+  res <- lapply(names(ca), function(..x){
+    intersect(ca[[..x]], pro[[1]])
+  })
+  names(res) <- names(ca)
+  return(res)
+})
+names(all_intersect_gene) <- names(cancer_DEG_list)
+all_intersect_gene
+```
+
+取交集后, 同预后差异基因有交集的主要集中在TC中, M1,M2细胞交集差异基因很少
+
+```{r enrichment_insterect_gene}
+
+
+
+all_instersect_enrichment_res <- 
+  lapply(all_intersect_gene, \(.x){
+  lapply(.x, \(..x){
+    enrichKEGG.function(..x, qvalueCutoff = 1, pvalueCutoff = 1) %>% 
+    as.data.frame()
+  })
+})
+plot.data <- all_instersect_enrichment_res %>% 
+  lapply(\(.x){
+    .x <- .x %>% 
+      do.call(rbind, .) %>% 
+      rownames_to_column("Group") %>% 
+      mutate(Group = str_extract(Group, ".*(?=\\.)")) %>% 
+      group_by(Group) %>% # 保存表格注释掉
+      slice_min(p.adjust, n = 5) %>% # 这里取了每个组中矫正p值前5位 # 保存表格注释掉
+      # 在画图之前, 先保存字符形式的Ratio
+      mutate(GeneRatio = trans2num(GeneRatio), BgRatio = trans2num(BgRatio)) # 保存表格注释掉
+    return(.x)
+  })
+write.xlsx(plot.data, 
+           file = paste0(CachePath, "enrichment_res/enrichment.results.xlsx"),
+           overwrite = T)
+pblapply(names(plot.data), function(.x){
+  print(.x)
+  dir <- paste0(CachePath, "enrichment_res/",.x, "/")
+  dir.create(dir, recursive = T)
+  p <- dotplot.function(plot.data[[.x]])
+  ggsave(filename = paste0(dir, "dotplot.pdf"), height = 20, width = 10, plot = p)
+})
+
+```
+
+### 5.2 The prognostic genes were verified
+
+logrank test预后真正有影响的基因, 由于没有具体的生存状态, 这里使用DFS和是否复发进行生存分析
+
+```{r WTA2Sample.expr}
+exp_group_object_advanced <- exp_group_object
+anno <- dplyr::select(exp_group_object@anno,c(38:48),)
+exp <- t(exp_group_object@exp)
+meandata <- cbind(anno,exp)#将病人名称与AOI结合
+#exp <- meandata %>% distinct(Sample,.keep_all = T)#随机选择相同病人的AOI
+exp <- aggregate(meandata[, 12:ncol(meandata)], by=list(meandata$TMA.position),mean) #计算同一病人不同AOI的均值
+rownames(exp) <- exp[,1]
+exp <- exp[,-1]
+exp_group_object_advanced@exp <- t(exp)
+exp_group_object_advanced@anno <- exp_group_object@anno[!duplicated(exp_group_object@anno$TMA.position),]
+rownames(exp_group_object_advanced@anno) <- exp_group_object_advanced@anno$TMA.position
+data <- exp_group_object_advanced
+data@anno$OS <- strsplit(data@anno$PFS_OS, " OS") %>% Reduce(rbind,.) %>% 
+  as.data.frame() %>% .[,2]
+data@anno$DFS <- strsplit(data@anno$PFS_OS, " OS") %>% Reduce(rbind,.) %>% 
+  as.data.frame() %>% .[,1]
+data@anno["08-1012-2",c("OS","DFS")] <- c("175","172.8")
+data@anno$OS <- data@anno$OS %>% gsub(pattern = " ",replacement = "")
+data@anno$DFS <- data@anno$DFS %>% gsub(pattern = "DFS ",replacement = "") %>% 
+  gsub(pattern = "DFS",replacement = "")
+data@anno["18-2116-4","DFS"] <- "54.8"
+data@anno$Status <- data@anno$Status %>% gsub(pattern = "未复发",replacement = "1") %>% 
+  gsub(pattern = "复发",replacement = "0") %>% as.numeric()
+data@anno$OS <- as.numeric(data@anno$OS)
+data@anno$DFS <- as.numeric(data@anno$DFS)
+```
+
+```{r Surv}
+exp <- data@exp %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  dplyr::select(unlist(all_intersect_gene) %>% as.character() %>% unique())
+anno <- data@anno %>% 
+  dplyr::select(DFS, Status)
+cal_data <- merge(anno, exp, by = 0) %>% 
+  column_to_rownames("Row.names")
+phe <- cal_data[, 1:2]
+mySurv <- with(cal_data, Surv(DFS, Status))
+exprSet <- cal_data[, -c(1:3)] %>% t
+log_rank_p <- apply(exprSet, 1 , function(gene){
+  # gene=exprSet[1,]
+  phe$group <- ifelse(gene > median(gene), 'high', 'low')  
+  data.survdiff <- survdiff(mySurv ~ group, data = phe)
+  p.val = 1 - pchisq(data.survdiff$chisq, length(data.survdiff$n) - 1)
+  return(p.val)
+})
+log_rank_p <- sort(log_rank_p)
+table(log_rank_p < 0.05)
+sig_gene <- log_rank_p[log_rank_p < 0.05] %>% names()
+```
+
+```{r survplot}
+
+for (g in sig_gene) {
+  phe <- phe %>%
+    dplyr::mutate(!!sym(g) := ifelse(exprSet[g, ] > median(exprSet[g, ]),'high','low'))
+  sfit1 <- survfit(as.formula(paste0("Surv(DFS, Status) ~ ", g)), data = phe)
+  p <- ggsurvplot(sfit1, pval =TRUE, data = phe, risk.table = TRUE)
+  pdf(file = paste0(CachePath, "survplot/", g, "_survplot.pdf"), onefile = F)
+  print(p)
+  dev.off()
+}
+table(phe$SULT1C2)
+table(phe$SOD2)
+```
+
+### 5.3 Cell interactions associated with prognosis
+
+```{r CellChat2}
+meta.data_all <- exp_group_object@anno %>%
+dplyr::select(cell_type = Morphology, Prognosis) %>%
+dplyr::filter(cell_type %in% c("M1", "M2", "TC"))
+data.input <- exp_group_object@exp %>%  # data.input need to a martix
+as.data.frame() %>%
+dplyr::select(rownames(meta.data))
+#### input good ###
+data.input <- data.input_all %>%
+as.data.frame() %>%
+dplyr::select(rownames(dplyr::filter(meta.data_all, Prognosis == "good"))) %>%
+as.matrix()
+meta.data <- meta.data_all %>%
+dplyr::filter(Prognosis == "good") %>%
+dplyr::select(-Prognosis)
+cellchat_martix <- createCellChat(object = data.input, meta = meta.data, group.by = "cell_type")
+CellChatDB <- CellChatDB.human
+cellchat_martix@DB <- CellChatDB
+cellchat_martix <- subsetData(cellchat_martix)
+cellchat_martix <- identifyOverExpressedGenes(cellchat_martix)
+cellchat_martix <- identifyOverExpressedInteractions(cellchat_martix)
+# execution.time = Sys.time() - ptm
+# print(as.numeric(execution.time, units = "secs"))
+# Compute the communication probability and infer cellular communication network
+cellchat_martix <- computeCommunProb(cellchat_martix, type = "triMean")
+cellchat_martix <- filterCommunication(cellchat_martix, min.cells = 10)
+cellchat_martix <- computeCommunProbPathway(cellchat_martix)
+cellchat_martix <- aggregateNet(cellchat_martix)
+# View(subsetCommunication(cellchat_martix))
+saveRDS(cellchat_martix, file = paste0(CachePath, "5.3 cellchat/5.3_good_cellchat_martix.RDs"))
+netAnalysis_contribution(cellchat_martix, signaling = "WNT")
+netVisual_circle(cellchat_martix@net$count,  vertex.weight = as.numeric(table(cellchat_martix@idents)), weight.scale = T)
+p <- netVisual_bubble(cellchat_martix, remove.isolate = F)
+ggsave(paste0(CachePath, "5.3 cellchat/5.3_good_cellchat.res.dotplot.pdf"), height = 45, width = 9)
+out.xlsx <- ggplot_build(p)
+write.xlsx(out.xlsx$plot$data, file = paste0(CachePath, "5.3 cellchat/5.3_good_cellchat.res.xlsx"))
+rm(data.input)
+CachePath <- paste0(Work_canche_dir, "Part V/")
+PlotsPath <- paste0(Work_canche_dir, "Part V/")
+create_dir(path.list = c(CachePath, PlotsPath))
+# default parameter
+Work_canche_dir <- "./personal_analysis/rmd_Results/"
+Work_plot_dir<- "./personal_analysis/rmd_Results/"
+CachePath <- paste0(Work_canche_dir, "Part V/")
+PlotsPath <- paste0(Work_canche_dir, "Part V/")
+saveRDS(cellchat_martix, file = paste0(CachePath, "5.3 cellchat/5.3_good_cellchat_martix.RDs"))
+netAnalysis_contribution(cellchat_martix, signaling = "WNT")
+netVisual_circle(cellchat_martix@net$count,  vertex.weight = as.numeric(table(cellchat_martix@idents)), weight.scale = T)
+p <- netVisual_bubble(cellchat_martix, remove.isolate = F)
+ggsave(paste0(CachePath, "5.3 cellchat/5.3_good_cellchat.res.dotplot.pdf"), height = 45, width = 9)
+out.xlsx <- ggplot_build(p)
+write.xlsx(out.xlsx$plot$data, file = paste0(CachePath, "5.3 cellchat/5.3_good_cellchat.res.xlsx"))
+rm(data.input)
+#### bad ###
+data.input <- data.input_all %>%
+as.data.frame() %>%
+dplyr::select(rownames(dplyr::filter(meta.data_all, Prognosis == "bad"))) %>%
+as.matrix()
+meta.data <- meta.data_all %>%
+dplyr::filter(Prognosis == "bad") %>%
+dplyr::select(-Prognosis)
+cellchat_martix <- createCellChat(object = data.input, meta = meta.data, group.by = "cell_type")
+CellChatDB <- CellChatDB.human
+cellchat_martix@DB <- CellChatDB
+cellchat_martix <- subsetData(cellchat_martix)
+cellchat_martix <- identifyOverExpressedGenes(cellchat_martix)
+cellchat_martix <- identifyOverExpressedInteractions(cellchat_martix)
+# execution.time = Sys.time() - ptm
+# print(as.numeric(execution.time, units = "secs"))
+# Compute the communication probability and infer cellular communication network
+cellchat_martix <- computeCommunProb(cellchat_martix, type = "triMean")
+cellchat_martix <- filterCommunication(cellchat_martix, min.cells = 10)
+cellchat_martix <- computeCommunProbPathway(cellchat_martix)
+cellchat_martix <- aggregateNet(cellchat_martix)
+# View(subsetCommunication(cellchat_martix))
+saveRDS(cellchat_martix, file = paste0(CachePath, "5.3 cellchat/5.3_bad_cellchat_martix.RDs"))
+netAnalysis_contribution(cellchat_martix, signaling = "WNT")
+netVisual_circle(cellchat_martix@net$count,  vertex.weight = as.numeric(table(cellchat_martix@idents)), weight.scale = T)
+p <- netVisual_bubble(cellchat_martix, remove.isolate = F)
+ggsave(paste0(CachePath, "5.3 cellchat/5.3_bad_cellchat.res.dotplot.pdf"), height = 45, width = 9)
+out.xlsx <- ggplot_build(p)
+write.xlsx(out.xlsx$plot$data, file = paste0(CachePath, "5.3 cellchat/5.3_bad_cellchat.res.xlsx"))
+
+bad_res <- out.xlsx$plot$data
+good_res <- read.xlsx(paste0(CachePath, "5.3 cellchat/5.3_good_cellchat.res.xlsx"))
+common_type <- intersect(good_res$source.target, bad_res$source.target)
+
+bad_res <- dplyr::filter(bad_res, source.target  %in% common_type) %>% 
+  dplyr::mutate(Group = "bad") %>% 
+  dplyr::select(Group, starts_with("inter"), source.target, prob, pval)
+good_res <- dplyr::filter(good_res, source.target  %in% common_type) %>% 
+  dplyr::mutate(Group = "good") %>% 
+  dplyr::select(Group, starts_with("inter"), source.target, prob, pval)
+plotdata <- rbind(bad_res, good_res) %>% 
+  mutate(Group = paste0(source.target, "_", Group))
+
+
+color.use <- RColorBrewer::brewer.pal(n = 10, name = "Spectral")
+p <- plotdata %>% 
+  ggplot(aes(x = Group, y = interaction_name_2, color = prob)) +
+  geom_point(pch = 16) +
+  theme_linedraw() + 
+  theme(panel.grid.major = element_line(color = "grey90"),
+        panel.grid.minor = element_line(color = "grey90")) +
+  scale_color_gradientn(colors =  colorRampPalette(color.use)(99), 
+                         na.value = "white", 
+                         limits = c(quantile(plotdata$prob, 0, na.rm = T), 
+                                    quantile(plotdata$prob, 1, na.rm = T)),  
+                         breaks = c(quantile(plotdata$prob, 0, na.rm = T), 
+                                    quantile(plotdata$prob, 1, na.rm = T)), 
+                         labels = c("min", "max")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  xlab("") + 
+  ylab("")
+ggsave(plot = p, filename = paste0(CachePath, "5.3 cellchat/commom_type_res.pdf"), height = 45, width = 9)
+  
+```
