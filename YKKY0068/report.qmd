@@ -1,0 +1,900 @@
+---
+title: "C42Seurat"
+author: "Guo Hao"
+format: 
+  html:
+    code-fold: True
+editor: visual
+---
+
+# 1 SCRNAseq data analysis
+
+# 1.1 Data reading and filtering
+
+```{r load_package_and_creat_the_function, warning=FALSE, message=FALSE, results='hold'}
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(SingleCellExperiment))
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(clustree))
+suppressPackageStartupMessages(library(openxlsx))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(ggpubr))
+suppressPackageStartupMessages(library(RColorBrewer))
+suppressPackageStartupMessages(library(ggrepel))
+suppressPackageStartupMessages(library(clusterProfiler))
+suppressPackageStartupMessages(library(ReactomePA))
+suppressPackageStartupMessages(library(enrichplot))
+suppressPackageStartupMessages(library(ggvenn))
+suppressPackageStartupMessages(library(ggsci))
+suppressPackageStartupMessages(library(RColorBrewer))
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+
+ReadDNbC4 <- function(Dir, samples, cellRangeroutput = "output/filter_matrix/", gzipped = TRUE){
+  fileNames <- c(matrix = "matrix.mtx", 
+                 features = "features.tsv", 
+                 barcodes = "barcodes.tsv")
+  
+  if (gzipped){
+    fileNames <- vapply(fileNames, \(.x){
+      paste0(.x, ".gz")
+    }, FUN.VALUE = character(1))
+  }
+  # read in data form samples
+  data <- lapply(samples, function(.x){
+    matrix.mtx <- Matrix::readMM(gzfile(file.path(Dir, .x, cellRangeroutput,
+                                                  fileNames[["matrix"]])))
+    feature <- read.table(gzfile(file.path(Dir, .x, cellRangeroutput, 
+                                 fileNames[["features"]])), sep = "\t")
+    barcode <- read.table(gzfile(file.path(Dir, .x, cellRangeroutput,
+                                 fileNames[["barcodes"]])), sep = "\t")
+    matrix.mtx <- as.matrix(matrix.mtx)
+    colnames(matrix.mtx) <- paste0(barcode[[1]], "_", .x)
+    rownames(matrix.mtx) <- feature[[1]]
+    return(matrix.mtx)
+  })
+  # cbind data 
+  ## Make sure all samples have the same genes
+  gene <- lapply(data, \(.x){rownames(.x)}) %>% unlist() %>% unique
+  data <- lapply(data, \(.x){
+    o <- matrix(0, nrow = length(gene) - dim(.x)[1], ncol = dim(.x)[2])
+    colnames(o) <- colnames(.x)
+    rownames(o) <- gene[!gene %in% rownames(.x)]
+    .x <- rbind(.x, o)
+    .x <- .x[order(row.names(.x)), ]
+    return(.x)
+  }) %>% do.call(cbind, .)
+  return(data)
+}
+# data <- ReadDNbC4(Dir="./result/", samples = sample_names)
+```
+
+### 1.1.1 Visualize QC metrics as a violin plot
+
+```{r read_in_data, message=FALSE, warning=FALSE}
+data <- readRDS("./rawdata/Seurat.Objcet.RDs")
+data$sampleid <- rownames(data@meta.data) %>% str_extract("(?<=N._).*")
+# data <- CreateSeuratObject(data, project = "Seurat.Object")
+# Visualize QC metrics as a violin plot
+VlnPlot(data, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+        ncol = 3, group.by = "sampleid")
+data <- subset(data, 
+               subset = nFeature_RNA > 500 & nCount_RNA > 100 & percent.mt < 20)
+```
+
+## 1.2 Normalizing the data and Find variable features
+
+```{r Normalizing_the_data, warning=F, message=FALSE}
+data <- data %>% 
+  NormalizeData() %>% 
+  FindVariableFeatures() %>% 
+  ScaleData(features = rownames(data)) %>% RunPCA()
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(data), 10)
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(data)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 / plot2
+VizDimLoadings(data, dims = 1:2, reduction = "pca")
+DimPlot(data, reduction = "pca") + NoLegend()
+DimHeatmap(data, dims = 1, cells = 500, balanced = TRUE)
+
+```
+
+## 1.3 Determine the 'dimensionality' of the dataset
+
+主成分筛选, 利用肘图进行主成分筛选
+
+```{r Elbowplot, message=FALSE, warning=F}
+stdev_percent <- data[["pca"]]@stdev / sum(data[["pca"]]@stdev) * 100
+# 转换成前端累计方差占比
+stdev_cumulated <- cumsum(stdev_percent)
+
+# 按照PC筛选阈值设置，找到方差占比较低的pc作出裁定。
+# 1. Determine which PC exhibits cumulative percent greater than 90% and 
+#     % variation associated with the PC as less than 5
+PC_cutoff_1 <- which(stdev_cumulated > 90 & stdev_percent < 5)[1]
+# 2. Determine the difference between variation of PC and subsequent PC
+#     where % of variation is less than 0.1% between two PCs
+PC_cutoff_2 <- sort(which((stdev_percent[1:length(stdev_percent) - 1] -
+						   	stdev_percent[2:length(stdev_percent)]) > 0.1), 
+					decreasing = T)[1] + 1
+
+# 两个筛选方式选择更靠前的
+PC_cutoff <- min(PC_cutoff_1, PC_cutoff_2)
+ElbowPlot(data)
+```
+
+## 1.4 Cluster the cell
+
+```{r clster_cell, message= FALSE, warning=FALSE}
+data <- FindNeighbors(data, dims = 1:PC_cutoff) %>% 
+  FindClusters(resolution = c(seq(0, 0.3, by = 0.1)), verbose = F)
+data <- RunUMAP(data, dims = 1:PC_cutoff, verbose = F)
+data <- RunTSNE(data, dims = 1:PC_cutoff)
+data@active.ident <- factor(data$RNA_snn_res.0.2)
+DimPlot(data, reduction = "umap", label = T)
+saveRDS(data, file = "./results/data.RDs")
+```
+
+## 1.5 Finding cluster biomarkers
+
+```{r Finding_cluster_biomarkers, message=FALSE, warning=FALSE, eval=FALSE}
+data <- readRDS("./results/data.RDs")
+data.marker <- FindAllMarkers(data, only.pos = T) %>% 
+  group_by(cluster) %>% 
+  dplyr::filter(avg_log2FC > 1)
+top10 <- data.marker %>% 
+  group_by(cluster) %>% 
+  slice_head(n = 10) %>% ungroup()
+output.res <- list(data.marker = data.marker, top10 = top10)
+write.xlsx(output.res, file = "./results/DEG/各个cluster的markergene.xlsx")
+p <- DoHeatmap(data, features = top10$gene) + NoLegend()
+ggsave(plot = p, filename = "./results/DEG/不同clustermarkergene热图.pdf", height = 12, width = 16)
+```
+
+## 1.6 Annotation Cluster cell type
+
+### Step 1
+
+粗分
+
+```{r annotation_step1, }
+immue <- c("PTPRC")
+epithelial <- c("EPCAM")
+fibrocyte <- c("MME", "FGF7")
+endotheliocyte <- c("PECAM1", "VMF")
+marker.list <- list(immue = immue, epithelial = epithelial, fibrocyte = fibrocyte,
+                    endotheliocyte = endotheliocyte)
+
+p <- suppressWarnings(DotPlot(data, features = marker.list)) +
+  RotatedAxis() +
+  scale_x_discrete("") +
+  scale_y_discrete("") +
+  theme(legend.title = element_text(size = 5))
+ggsave(plot = p, filename = "./results/celltype_annotation/粗分点图.pdf")
+data$cell_type <- "CellType"
+attach(data@meta.data)
+data@meta.data[which(RNA_snn_res.0.2 %in% c(0, 1, 5, 6, 3, 8)), ]$cell_type <- "Immune"
+data@meta.data[which(RNA_snn_res.0.2 %in% c(4)), ]$cell_type <- "Epithelial"
+data@meta.data[which(RNA_snn_res.0.2 %in% c(7)), ]$cell_type <- "Endothelial"
+data@meta.data[which(RNA_snn_res.0.2 %in% c(9, 2)), ]$cell_type <- "Fibrocyte"
+detach(data@meta.data)
+p <- suppressWarnings(DotPlot(data, 
+                         features = marker.list,
+                         group.by = "cell_type"
+                         )) +
+  RotatedAxis() +
+  scale_x_discrete("") +
+  scale_y_discrete("") +
+  # RestoreLegend(position = "top")
+  theme(legend.title = element_text(size = 5),
+        legend.position = "top")
+ggsave(plot = p, filename = "./results/celltype_annotation/粗分验证点图.pdf")
+p <- DimPlot(data, reduction = "umap", label = T, group.by = "cell_type")
+ggsave(plot = p, filename = "./results/celltype_annotation/粗分UMAP.pdf")
+```
+
+### Step 2
+
+细分免疫细胞
+
+```{r annotation_immune_Cell}
+immune_expr <- subset(data, cell_type == "Immune")
+# NK.cell <- c("GNLY", "NKG7")
+# Naive.CD4.T <- c("IL7", "CCR7")
+# CD14.Momo <- c("CD14", "LYZ")
+# Memory.CD4 <- c("IL7R", "S100A4")
+# B.cell <- c("MS4A1", "CD19", "CD20")
+# CD8.T <- c("CD8A")
+# DC <- c("FCER1A", "CST3")
+# 
+# immune.marker.list <- list(NK.cell = NK.cell,
+#                            Naive.CD4.T = Naive.CD4.T,
+#                            CD14.Momo = CD14.Momo,
+#                            Memory.CD4 = Memory.CD4,
+#                            B.cell = B.cell,
+#                            CD8.T = CD8.T,
+#                            DC = DC)
+immune.marker.list <- list(
+  B_cell = c('MS4A1', 'CD79A', 'CD79B',
+             # 'CD19','MZB1','BANK1', 
+             "MACROD2"),
+  Macrophage = c('AIF1', 'CD14', 'CD163'),
+  Mast = c('CPA3', 'MS4A2', 'TPSB2'),
+  NK_cell = c('NKG7', 'KLRD1', 'GZMB', 'KLRF1'),
+  T_cell = c('CD2', 'CD3D', 'CD3E')
+  # epithelial = epithelial, 
+  # fibrocyte = fibrocyte,
+  # endotheliocyte = endotheliocyte
+)
+p <- DotPlot(immune_expr, features = immune.marker.list) +
+  RotatedAxis() +
+  scale_x_discrete("") +
+  scale_y_discrete("") +
+  theme(legend.title = element_text(size = 5))
+ggsave(plot = p, filename = "./results/celltype_annotation/免疫细胞注释点图.pdf", height = 8, width = 10)
+attach(data@meta.data)
+data@meta.data[which(RNA_snn_res.0.2 %in% c(3, 6)), ]$cell_type <- "Bcell"
+data@meta.data[which(RNA_snn_res.0.2 %in% c(1, 5)), ]$cell_type <- "Macrophage"
+data@meta.data[which(RNA_snn_res.0.2 %in% c(8)), ]$cell_type <- "Mast"
+data@meta.data[which(RNA_snn_res.0.2 %in% c(0)), ]$cell_type <- "NK.Tcell"
+detach(data@meta.data)
+rm(immune_expr)
+# DotPlot(data, features = marker.all,
+#         group.by = "cell_type") +
+#   RotatedAxis() +
+#   scale_x_discrete("") +
+#   scale_y_discrete("") +
+#   theme(legend.title = element_text(size = 5))
+marker.all <- list(
+  B_cell = c('MS4A1', 'CD79A', 'CD79B',
+             # 'CD19','MZB1','BANK1', 
+             "MACROD2"),
+  Macrophage = c('AIF1', 'CD14', 'CD163'),
+  Mast = c('CPA3', 'MS4A2', 'TPSB2'),
+  NK_cell = c('NKG7', 'KLRD1', 'GZMB', 'KLRF1'),
+  T_cell = c('CD2', 'CD3D', 'CD3E'),
+  epithelial = epithelial,
+  fibrocyte = fibrocyte,
+  endotheliocyte = endotheliocyte
+)
+p <- DotPlot(data, features = marker.all,
+        group.by = "cell_type") +
+  RotatedAxis() +
+  scale_x_discrete("") +
+  scale_y_discrete("") +
+  theme(legend.title = element_text(size = 5))
+ggsave(plot = p, filename = "./results/celltype_annotation/免疫细胞验证点图.pdf")
+p <- DimPlot(data, reduction = "umap", label = T, group.by = "cell_type")
+ggsave(plot = p, filename = "./results/celltype_annotation/最终结果UMAP.pdf")
+saveRDS(data, file = "./results/annotation.Seurat.Object.RDs")
+```
+
+### step 3
+
+可视化
+
+```{r}
+cellcounts <- sapply(celltype, function(.x){
+  .r <- data@meta.data %>% filter(cell_type == .x)
+  table(.r$sampleid) %>% as.matrix() %>% t
+}) %>% lapply(\(.x) as.data.frame(.x))
+cellcounts$Mast <- cellcounts$Mast %>% dplyr::mutate("2N" = 0)
+cellcounts <- cellcounts %>% do.call(rbind, .)
+
+cellcounts %>% 
+  rownames_to_column("Group") %>% 
+  pivot_longer(cols = -Group) %>% 
+  mutate(Group2 = ifelse(grepl("N$", name), "N", "T")) -> plotdata
+plotdata$Group <- factor(plotdata$Group, levels = unique(plotdata$Group))
+stat.test <- plotdata %>%
+  group_by(Group) %>%
+  t_test(
+    value ~ Group2, 
+    detailed = TRUE,
+    # paired = TRUE
+  ) %>%
+  add_xy_position(x = "Group")%>% 
+  adjust_pvalue() %>% 
+  add_significance("p.adj")
+
+p <- plotdata %>% 
+  ggboxplot("Group", "value", fill = "Group2", order = unique(.$Group)) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  guides(fill = guide_legend(title = "Group")) + 
+  xlab("") + 
+  ylab("Cell counts") + 
+  stat_pvalue_manual(stat.test, label = "p", tip.length = 0, y.position = 1200) 
+ggsave(filename = "../results/celltype_annotation/不同细胞类型在不同样本中细胞数的差异.pdf", plot = p)
+```
+
+## 1.7 差异分析
+
+在本次差异分析中, 筛选的差异基因的阈值为 avg_logFC 绝对值 \> 0.5, adjuestec.p \< 0.05, 上下调中最显著的10个基因将会被标记出来()
+
+```{r DEG_analysis}
+data <- readRDS("./results/annotation.Seurat.Object.RDs")
+## renames the sampleID
+data$sampleid <- data$sampleid %>% 
+  gsub(pattern = "22R3153AZZA",replacement = "5T") %>% 
+  gsub(pattern = "22R3205APZA",replacement = "2N") %>% 
+  gsub(pattern = "22R5737AZZA",replacement = "2T") %>%
+  gsub(pattern = "22R8701APZA",replacement = "5N")
+data@meta.data <-  dplyr::mutate(data@meta.data, 
+                                 sampleID = str_extract(sampleid, ".$"))
+celltype <- unique(data$cell_type)
+data@active.ident <- factor(data$sampleid)
+## 2T vs. 2N
+sapply(celltype, function(.x){
+  .r <- data@meta.data %>% filter(cell_type == .x)
+  table(.r$sampleid)
+})
+res2NT <- lapply(celltype[1:5], \(.x){
+  .data <- subset(data, cell_type == .x)
+  res <- FindMarkers(.data, ident.1 = "2T", ident.2 = "2N", only.pos = F) %>% 
+    rownames_to_column("Gene")
+  return(res)
+})
+names(res2NT) <- celltype[1:5]
+## 5T vs. 5N
+res5NT <- lapply(celltype[1:5], \(.x){
+  .data <- subset(data, cell_type == .x)
+  res <- FindMarkers(.data, ident.1 = "5T", ident.2 = "5N", only.pos = F) %>% 
+    rownames_to_column("Gene")
+  
+  return(res)
+})
+names(res5NT) <- celltype[1:5]
+## T vs. N
+sapply(celltype, function(.x){
+  .r <- data@meta.data %>% filter(cell_type == .x)
+  table(.r$sampleID)
+})
+data@active.ident <- factor(data$sampleID)
+res.NT <- lapply(celltype[1:4], \(.x){
+    .data <- subset(data, cell_type == .x)
+    res <- FindMarkers(.data, ident.1 = "T", ident.2 = "N", only.pos = F) %>% 
+      rownames_to_column("Gene")
+    return(res)
+})
+names(res.NT) <- celltype[1:4]
+data@misc$DEG_group <- list(res.NT = res.NT, res2NT = res2NT, res5NT = res5NT)
+
+# saveRDS(data, file = "./results/DEG_Seurat.Object.RDs")
+# data <- readRDS("E:/CRO项目/scRNA/C4/YKKY0068/20240108_之前的均作废/results/DEG_Seurat.Object.RDs")
+
+# a <- data@misc$DEG_group$res.NT$Macrophage %>% 
+#   #dplyr::filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+#   mutate(Change = ifelse(abs(avg_log2FC) < 0.5 | p_val_adj > 0.05, "NOT", 
+#                          ifelse(avg_log2FC > 0.5, "UP", "DOWN")))
+
+data@misc$DEG_group <- data@misc$DEG_group %>% 
+  lapply(\(.x){
+    lapply(.x, \(..x){
+      .data <- ..x %>% 
+      mutate(Change = ifelse(abs(avg_log2FC) < 0.5 | p_val_adj > 0.05, "NOT", 
+                         ifelse(avg_log2FC > 0.5, "UP", "DOWN"))) 
+  })
+})
+data@misc$DEG_group$res.NT$Macrophage %>% 
+  ggplot(aes(x = avg_log2FC, y = -log10(p_val_adj))) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "#999999") +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "#999999") +
+  geom_point(aes(color = Change), size = 2, alpha = 0.8) + 
+  theme_bw() + 
+  scale_color_manual(values = c("#1F78B4", "#666666", "#E31A1C")) + 
+  geom_text_repel(data = .%>% 
+                    group_by(Change) %>% 
+                    slice_min(p_val_adj, n = 10) %>% 
+                    filter(Change != "NOT"), 
+                  aes(label = Gene), max.overlaps = 20) +
+    theme(axis.line.x = element_blank(),
+          axis.text.x = element_blank(),
+          panel.grid = element_blank(),
+          legend.title = element_blank())
+  # ggsave(filename = paste0("./results/DEG_volcano_plot/", ,"_volcano_plot"))
+lapply(names(data@misc$DEG_group), \(.x){
+  data <- data@misc$DEG_group[[.x]]
+  for(i in names(data)){
+    dir <- paste0("./results/DEG_volcano_plot/", .x)
+    dir.create(dir, showWarnings = F)
+    p <- data[[i]] %>%
+      ggplot(aes(x = avg_log2FC, y = -log10(p_val_adj))) +
+      geom_hline(
+        yintercept = -log10(0.05),
+        linetype = "dashed",
+        color = "#999999"
+      ) +
+      geom_vline(
+        xintercept = c(-0.5, 0.5),
+        linetype = "dashed",
+        color = "#999999"
+      ) +
+      xlab("Log2FoldChange") + 
+      ylab("-Log10(P.adjuested)") +
+      geom_point(aes(color = Change), size = 2, alpha = 0.8) +
+      theme_bw() +
+      scale_color_manual(values = c("#1F78B4", "#666666", "#E31A1C")) +
+      geom_text_repel(
+        data = . %>%
+          group_by(Change) %>%
+          slice_min(p_val_adj, n = 10) %>%
+          filter(Change != "NOT"),
+        aes(label = Gene),
+        max.overlaps = 20
+      ) +
+      theme(
+        axis.line.x = element_blank(),
+        axis.text.x = element_blank(),
+        panel.grid = element_blank(),
+        legend.title = element_blank()
+)
+        ggsave(filename = paste0(dir, "/", i, "_volcano.pdf"))
+      
+  }
+})
+saveRDS(data, file = "./results/DEG_Seurat.Object.RDs")
+```
+
+## 1.8 富集分析
+
+利用GSEA富集PB \| Regulation of lipid metabolism by PPARalpha (reactome.org)数据库中的通路
+
+```{r enrichment_res}
+data <- readRDS("E:/CRO项目/scRNA/C4/YKKY0068/20240108_之前的均作废/results/DEG_Seurat.Object.RDs")
+tranSymbol <- function(genelist, org = c("hsa", "mmu")){
+  library(clusterProfiler)
+    if (org == "hsa") {
+        eg = bitr(genelist, fromType = "SYMBOL", toType = "ENTREZID", 
+            OrgDb = "org.Hs.eg.db")
+    }
+    if (org == "mm" || org == "mmu") {
+        eg = bitr(genelist, fromType = "SYMBOL", toType = "ENTREZID", 
+            OrgDb = "org.Mm.eg.db")
+    }
+    return(eg)
+}
+tidy.genelist <- function(.data, org = "hsa"){
+  .data <- .data %>% 
+    dplyr::select(Gene, avg_log2FC) %>% 
+    arrange(desc(avg_log2FC))
+  EntrezID <- suppressWarnings(tranSymbol(as.character(.data$Gene),org = "hsa")) 
+  tmp_gene <- merge(.data, EntrezID, by.x = "Gene", by.y = "SYMBOL",sort = F)
+  genelist <- tmp_gene$avg_log2FC
+  names(genelist) <- tmp_gene$ENTREZID 
+  return(genelist)
+}
+gseRA <- function(.data, ...){
+  genelist <- suppressMessages(tidy.genelist(.data))
+  res <- suppressMessages(suppressWarnings(gsePathway(genelist, 
+                                                      pvalueCutoff = 1,
+                                                      seed = 1)))
+  return(res)
+}
+
+# res2 <- gseRA(data@misc$DEG_group$res.NT$Macrophage)
+data@misc$GSEA.RA.res <- 
+  lapply(data@misc$DEG_group, \(.x){
+  lapply(.x, \(..x){
+    res <- gseRA(..x)
+    return(res)
+  })
+})
+#### save the all pathway to xlsx 
+lapply(names(data@misc$GSEA.RA.res), \(.x){
+  dir <- paste0("./results/GSEA_enrich/", .x, "/", "allpathway.xlsx")
+  # dir.create(dir, showWarnings = F, recursive = T)
+  write.xlsx(data@misc$GSEA.RA.res[[.x]], file = dir, overwrite = T)
+})
+saveRDS(data, file = "./results/Enrichment.res_Seurat.Object.RDs")
+```
+
+```{r enrichment_plot}
+do_gsea_bubbleplot <- function(enr){
+  if (is.null(enr)) {
+        return(text_only_ggplot("Not enough differentially expressed genes \n for enrichment analysis"))
+    }
+    if (nrow(enr) == 0) {
+        p <- text_only_ggplot("Not enough differentially expressed genes \n for enrichment analysis")
+    }
+    else {
+        enr@result$Description <- str_wrap(enr@result$Description, 
+            100)
+        term_num = length(enr$Description)
+        if (term_num > 20) {
+            term_num = 20
+        }
+        p <- try(suppressMessages(clusterProfiler::dotplot(enr, 
+            showCategory = term_num, font.size = 8) + 
+              scale_colour_gradient(high = "royalblue3", 
+                                    low = "indianred3") + 
+              theme(plot.margin = unit(c(1, 2, 1, 2), "lines"),
+                    legend.text = element_text(size = 7), 
+            legend.title = element_text(size = 7))))
+        
+        if (inherits(try(ggplot_build(p), silent = TRUE), "try-error")) {
+            p <- text_only_ggplot("Not enough differentially expressed genes \n for enrichment analysis")
+        }
+    }
+    return(p)
+}
+lapply(names(data@misc$GSEA.RA.res), \(.x){
+  data <- data@misc$GSEA.RA.res[[.x]]
+  dir <- paste0("./results/GSEA_enrich/", .x)
+  dir.create(dir, showWarnings = F, recursive = T)
+  for(i in names(data)){
+    p <- do_gsea_bubbleplot(data[[i]])
+    ggsave(filename = paste0(dir, "/", i, "_enrich-bubble.pdf"), 
+           plot = p, 
+           height = 12)
+  }
+})
+```
+
+## 1.9 各个组差异基因和脂质代谢通路基因
+
+### 1.9.1 整体分析差异基因、差异富集通路和老师提供的表格进行比对，取交集。
+
+```{r DGE_and_LMP(Lipid_metabolic_pathway)}
+
+lipM_pathway <- read.xlsx("./rawdata/脂代谢通路(1).xlsx") %>% 
+  dplyr::mutate(ID = gsub(ID, patter = " ", replace = "")) %>% 
+  distinct(Name,.keep_all = T) %>% 
+  mutate(ID = str_extract(ID, ".*(?=\\.)"))
+#  清除字符串前的一个未知空格字符
+chr <- str_extract(lipM_pathway[40,2], ".")
+lipM_pathway$ID <- gsub(chr, "", lipM_pathway$ID)
+
+data@misc$GSEA.RA.res %<>% 
+  lapply(\(.x){
+    lapply(.x, \(..x){
+      ..x@result %<>% dplyr::filter(pvalue < 0.05)
+      return(..x)
+    })
+  })
+#### 提取跟脂质代谢通路共有的通路 并写出
+Commom.Path <- data@misc$GSEA.RA.res %>% 
+  lapply(\(.x){
+    lapply(.x, \(..x){
+      .data <- ..x@result %>% 
+        dplyr::filter(ID  %in% lipM_pathway$ID)
+      return(.data)
+    })
+  })
+lapply(names(Commom.Path), \(.x){
+  dir <- paste0("./results/GSEA_enrich/", .x, "/", "common.pathway.xlsx")
+  # dir.create(dir, showWarnings = F, recursive = T)
+  write.xlsx(Commom.Path[[.x]], file = dir, overwrite = T)
+})
+
+
+library(UpSetR)
+library(magrittr)
+
+exp_list <- Commom.Path[[3]]
+exp_list <- lapply(exp_list, rownames, lipM_pathway)
+# exp_list[["lipM_pathway"]] <- lipM_pathway$ID
+upset_plot <- function(plot.data, title = "You need set a title"){
+  plot.data %>% 
+  ggplot(aes(x = counts)) +
+  geom_bar() +
+  scale_x_upset(
+    order_by = "degree",
+    reverse = T, 
+  ) + 
+  geom_text(stat='count', aes(label=after_stat(count)), vjust=-1) + 
+  scale_y_continuous(name = "Intersection size",
+                     expand = c(0, 0), limits = c(0, NA))+
+  theme(text = element_text(family = "sans",
+                            colour = "black", size = 9))+
+  xlab('')+
+  theme_combmatrix(
+    combmatrix.label.text = element_text(family = "sans", colour = "black", size = 9),
+  )+
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2))+
+  theme(panel.background = element_blank(),
+        axis.text.y = element_text(size = 9)
+  ) + 
+  ggtitle(title)
+
+  }
+
+lapply(names(Commom.Path), \(.x){
+  exp_list <- lapply(Commom.Path[[.x]], rownames)
+  
+  plot.data <- exp_list %>% 
+  fromList() %>% apply(2, as.logical) %>% t %>% 
+  as_tibble(rownames = "ddd") %>% 
+  setNames(c("Celltype", unlist(exp_list) %>% unique())) %>% 
+  pivot_longer(col = -Celltype, values_to = "stat", names_to = "pathway") %>% 
+  dplyr::filter(stat) %>% dplyr::select(-stat) %>% group_by(pathway) %>% 
+  summarise(counts = list(Celltype))
+
+  output <- right_join(lipM_pathway, plot.data, by = join_by(ID == pathway)) %>%
+  write.xlsx(file = paste0("./results/GSEA_enrich/", .x, "/upset.data.xlsx"))
+
+  p <- upset_plot(plot.data, 
+                  title = .x)
+  ggsave(plot = p, 
+         filename = paste0("./results/GSEA_enrich/", .x, "/upset.pdf"))
+  
+})  
+```
+
+```{r DEG_and_LMP_gene}
+data <- readRDS("E:/CRO项目/scRNA/C4/YKKY0068/results/Enrichment.res_Seurat.Object.RDs")
+LM_gene <- read.xlsx("./rawdata/脂代谢gene.xlsx")
+
+DEG <- lapply(data@misc$DEG_group, function(.x){
+  lapply(.x, \(..x){
+   up <-  ..x %>% dplyr::filter(Change == "UP")
+   down <- ..x %>% dplyr::filter(Change == "DOWN")
+   return(list(up = up, down = down))
+  })
+})
+
+saveRDS(DEG, file = "./results/DEG.RDs")
+# deg_max <- DEG$res.NT$Macrophage$up
+
+Venn.plot <- function(DEG, LM_gene, dir){
+  suppressWarnings(dir.create(dir, recursive = T))
+  gene_intersection <- intersect(LM_gene$gene, DEG$Gene)
+  output.list <- list(LM_gene = LM_gene$gene,
+                      DEG = DEG$Gene,
+                      intersection = gene_intersection)
+  write.xlsx(output.list, file = paste0(dir,"/res.xlsx"))
+  plot.list <- list(LM_gene = LM_gene$gene,
+                     DEG = DEG$Gene)
+  p <- plot.list %>% 
+    ggvenn(stroke_color = "white", digits = 1) + 
+    ggsci::scale_fill_lancet()
+  ggsave(plot = p, filename = paste0(dir, "/venn.pdf"))
+}
+
+# Venn.plot(DEG = deg_max, LM_gene = LM_gene, dir = "./test/")
+
+lapply(names(DEG), \(.x){
+  .data <- DEG[[.x]]
+  lapply(names(.data), \(.y){
+    .ydata <- .data[[.y]]
+    lapply(names(.ydata), \(.z){
+      .zdata <- .ydata[[.z]]
+      dir <- paste0("./results/", .x, "/", .y, "/", .z,"/")
+      Venn.plot(DEG = .zdata, LM_gene = LM_gene, dir = dir)
+    })
+  })
+})
+#### 利用purrr可以对特定层级的list进行处理
+### 需要注意的是list层数是从0 开始的
+# library(purrr)
+# 
+# map_depth(DEG, 3, print, )
+
+```
+
+## 1.10 配受体分析-CellChat
+
+```{r cellchat_analysis}
+suppressPackageStartupMessages(library(CellChat))
+suppressPackageStartupMessages(library(patchwork))
+# ptm = Sys.time()
+data.input <- data@assays$RNA$data
+meta.data <- data@meta.data %>% dplyr::select(cell_type)
+unique(meta.data$cell_type)
+cellchat_martix <- createCellChat(object = data.input, meta = meta.data, group.by = "cell_type")
+cellchat_Seurat <- createCellChat(object = data, group.by = "cell_type")
+CellChatDB <- CellChatDB.human
+showDatabaseCategory(CellChatDB)
+#### 筛选不同的子集计算细胞之间的通讯 可以选择的有:
+### `unique(CellChatDB$interaction$annotation)`
+### 这里我选择所有的子集
+cellchat_martix@DB <- CellChatDB
+### ps: 但是这里我觉得这应该就是按照列名去进行检索, 因此, 理论上任何一列都可以
+### 测试一下 我只想用v2版本的配受体
+## test.BD <- subsetDB(CellChatDB, search = "CellChatDB v2", key = "version")
+## it will work
+
+### subset the expression data of signaling for saving computation cost
+cellchat_martix <- subsetData(cellchat_martix)
+
+cellchat_martix <- identifyOverExpressedGenes(cellchat_martix)
+cellchat_martix <- identifyOverExpressedInteractions(cellchat_martix)
+# execution.time = Sys.time() - ptm
+# print(as.numeric(execution.time, units = "secs"))
+
+# Compute the communication probability and infer cellular communication network
+cellchat_martix <- computeCommunProb(cellchat_martix, type = "triMean")
+cellchat_martix <- filterCommunication(cellchat_martix, min.cells = 10)
+cellchat_martix <- computeCommunProbPathway(cellchat_martix)
+cellchat_martix <- aggregateNet(cellchat_martix)
+saveRDS(cellchat_martix, file = "./results/cellchat/cellchat_martix.RDs")
+netVisual_circle(cellchat_martix@net$count,  vertex.weight = as.numeric(table(cellchat_martix@idents)), weight.scale = T)
+
+```
+
+### 1.10.1 细胞通讯可视化
+
+```{r}
+### classical circleplot
+cellchat_martix <- readRDS("E:/CRO项目/scRNA/C4/YKKY0068/results/cellchat/cellchat_martix.RDs")
+groupSize <- as.numeric(table(cellchat_martix@idents))
+netVisual_circle(cellchat_martix@net$count,  vertex.weight = as.numeric(table(cellchat_martix@idents)), weight.scale = T, title.name = "ANC")
+
+mat <- cellchat_martix@net$weight
+par(mfrow = c(3,4), xpd=TRUE)
+for (i in 1:nrow(mat)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i])
+}
+
+p <- netVisual_bubble(cellchat_martix, remove.isolate = F)
+ggsave("./results/cellchat/cellchat.res.dotplot.pdf", height = 16, width = 9)
+out.xlsx <- ggplot_build(p)
+write.xlsx(out.xlsx$plot$data, file = "./results/cellchat/cellchat.res.xlsx")
+p <- netVisual_circle(mat)
+ggsave(plot = p, filename = "./results/cellchat/cellcha.res.netplot.pdf")
+
+```
+
+## 1.11 Cell proportion
+
+```{r cell_proportion }
+data <- readRDS("./results/annotation.Seurat.Object.RDs")
+cell_counts <- list( "2N" = dplyr::filter(data@meta.data, sampleid == "2N"),
+                     "2T" = dplyr::filter(data@meta.data, sampleid == "2T"),
+                     "5N" = dplyr::filter(data@meta.data, sampleid == "5N"),
+                     "5T" = dplyr::filter(data@meta.data, sampleid == "5T"),
+                     "N" = dplyr::filter(data@meta.data, grepl("N", sampleid)),
+                     "T" = dplyr::filter(data@meta.data, grepl("T", sampleid))
+                     )
+## calculation the cell proportion in difference group
+prop_function <- function(data_frame, col = "cell_type", var_name = "Cell_type"){
+  data_frame <- table(data_frame[, col]) %>% 
+    prop.table(.) %>% 
+    round(2) %>% 
+    as.data.frame() %>% 
+    dplyr::rename(!!sym(var_name) := Var1)
+  return(data_frame)
+}
+prop_function(cell_counts[[1]])
+
+cell_proportion <- lapply(cell_counts, prop_function) %>% 
+  do.call(rbind, .) %>% 
+  rownames_to_column("Group") %>% 
+  mutate(Group = str_extract(Group, ".*(?=\\.)"))
+p <- ggbarplot(cell_proportion, x = "Group", y = "Freq", fill = "Cell_type") +
+  labs(fill = "Cell Type") + 
+  scale_fill_manual(values = col_vector) +
+  theme(legend.position = "right")
+ggsave(plot = p, filename = "./results/Cell proportion/cellProportion_diffgroup.pdf")
+```
+
+## 1.12 Dim/bright annotation
+
+由于无法直接注释到CD56dim/bright(FCGR3A :: CD16 的在所有cluster中都大于NCAM1(CD56), 因此全部都是CD56dim 可能在肿瘤中是正常的, 毕竟dim是具有杀伤性的nkcell )
+
+因此这里直接将Seurat 取了两次亚群, NKTcell → N/T 分别利用FindAllMarker 计算每个cluster的marker gene来区分不同的cluster
+
+还是很难注释
+
+只能通过不同组别的表达量进行比较了
+
+### 1.12.1 Dim/bright_annotation_function
+
+```{r Dim/bright_annotation_function }
+standard_analysis_Function <- function(NkT_seurat){
+NkT_seurat <- NormalizeData(NkT_seurat, verbose = FALSE)
+NkT_seurat <- FindVariableFeatures(NkT_seurat, selection.method = "vst", nfeatures = 2000)
+NkT_seurat <- ScaleData(object = NkT_seurat, verbose = FALSE)
+
+NkT_seurat <- RunPCA(object = NkT_seurat, verbose = FALSE, npcs = 50)
+NkT_seurat <- JackStraw(object = NkT_seurat, num.replicate = 50, prop.freq=0.025, dims = 50)
+NkT_seurat <- ScoreJackStraw(NkT_seurat, dims = 1:50)
+
+# PCA分析步骤
+NkT_seurat <- RunPCA(object = NkT_seurat, verbose = FALSE, npcs = 50)
+# 识别每个PC占据整体数据方差的百分比
+stdev_percent <- NkT_seurat[["pca"]]@stdev / sum(NkT_seurat[["pca"]]@stdev) * 100
+# 转换成前端累计方差占比
+stdev_cumulated <- cumsum(stdev_percent)
+# 按照PC筛选阈值设置，找到方差占比较低的pc作出裁定。
+# 1. Determine which PC exhibits cumulative percent greater than 90% and 
+#     % variation associated with the PC as less than 5
+PC_cutoff_1 <- which(stdev_cumulated > 90 & stdev_percent < 5)[1]
+# 2. Determine the difference between variation of PC and subsequent PC
+#     where % of variation is less than 0.1% between two PCs
+PC_cutoff_2 <- sort(which((stdev_percent[1:length(stdev_percent) - 1] -
+                             stdev_percent[2:length(stdev_percent)]) > 0.1), 
+                    decreasing = T)[1] + 1
+# 两个筛选方式选择更靠前的
+PC_cutoff <- min(PC_cutoff_1, PC_cutoff_2)
+NkT_seurat <- FindNeighbors(object = NkT_seurat, reduction = "pca", dims = 1:PC_cutoff, verbose = FALSE)
+NkT_seurat <- suppressMessages(FindClusters(object = NkT_seurat, 
+                                      resolution = c(seq(0, 1, by = 0.1))))
+NkT_seurat <- suppressMessages(RunUMAP(NkT_seurat, reduction = "pca", dims = 1:PC_cutoff, 
+                                 verbose = FALSE))
+NkT_seurat <- suppressMessages(RunTSNE(object = NkT_seurat, dims.use = 1:PC_cutoff, 
+                                 do.fast = TRUE, check_duplicates = FALSE))
+}
+```
+
+### 1.12.2 Findallmarkergene_in_NT
+
+```{r Findallmarkergene_in_NT}
+NkT_seurat <- subset(data, cell_type == "NK.Tcell")
+NkT_seurat@meta.data <- NkT_seurat@meta.data %>% 
+  dplyr::select(!starts_with(c("seur", "RNA_snn")))
+NkT_seurat_N <- subset(NkT_seurat, sampleid  %in% c("2N", "5N"))
+NkT_seurat_T <- subset(NkT_seurat, sampleid  %in% c("2T", "5T"))
+NkT_seurat <- standard_analysis_Function(NkT_seurat)
+NkT_seurat_N <- standard_analysis_Function(NkT_seurat_N)
+NkT_seurat_T <- standard_analysis_Function(NkT_seurat_T)
+
+NkT_seurat_marker_N <- FindAllMarkers(NkT_seurat_N, only.pos = F, logfc.threshold = 0, features = c("FCGR3A","NCAM1"))
+NkT_seurat_marker_T <- FindAllMarkers(NkT_seurat_T, only.pos = T, logfc.threshold = 0, features = c("FCGR3A","NCAM1"))
+
+NkT_seurat_marker <- FindAllMarkers(NkT_seurat, only.pos = F, logfc.threshold = 0, features = c("FCGR3A","NCAM1"))
+  
+NkT_seurat_marker_N %>% 
+  dplyr::filter(gene %in% c("FCGR3A","NCAM1")) %>% 
+  split(f = .[,"gene"])
+table(NkT_seurat_N$seurat_clusters)
+NkT_seurat_marker_T %>% 
+  dplyr::filter(gene %in% c("FCGR3A","NCAM1")) %>% 
+  split(f = .[,"gene"])
+
+# NkT_seurat_N@meta.data[which(NkT_seurat_N@meta.data$seurat_clusters == 3),]$cell_type <- "CD56bright"
+# NkT_seurat_N@meta.data[which(NkT_seurat_N@meta.data$seurat_clusters == 5),]$cell_type <- "CD56dim"
+```
+
+### 1.12.3 CD56dim_plot
+
+```{r CD56dim_plot}
+genes_to_check = c('CD45', 'CD3', 'CD4')
+DotPlot(NkT_seurat, features = genes_to_check, group.by = 'RNA_snn_res.0.3') + coord_flip()
+genes_to_check = c('FCGR3A', 'NCAM1', 'KLRD1', 'CD4')
+DotPlot(NkT_seurat, features = genes_to_check, group.by = 'RNA_snn_res.0.3') + coord_flip()
+
+DimPlot(NkT_seurat, reduction = "umap", label = TRUE,
+        label.size = 6, pt.size = 1.2,group.by = "RNA_snn_res.0.1")
+
+ # NkT_seurat@active.ident <- NkT_seurat$RNA_snn_res.0.1
+# CD16: FCGR3A CD56: NCAM1
+# 根据NK细胞表面分化抗原56（Cluster of differentiation, CD）密度的不同，人NK细胞可以分为CD 56 dim 和CD 56 bright 2个亚群。CD 56 dim具有杀伤靶细胞的细胞毒活性，是NK细胞的主要组成，约占其总数的（90-95）%；CD56 bright细胞以分泌免疫调控因子为主，大约占NK细胞的（5-10）%。
+DotPlot(data, features = c("FCGR3A","NCAM1"), idents = data$RNA_snn_res.0.2)#利用CD56和CD16分群
+
+DotPlot(NkT_seurat, features = c("FCGR3A","NCAM1"), idents = NkT_seurat$seurat_clusters)
+p <- FeaturePlot(NkT_seurat, features =  c("FCGR3A","NCAM1"), pt.size = 0.5, blend = T,keep.scale = "all",
+            #cols = c("FCGR3A" = "red", "NCAM1" = "blue"), 
+            combine = T,
+            split.by = "RNA_snn_res.0.4"
+            )
+ggsave(plot = p, filename = "./results/Cell proportion/Featureplot_blend.pdf", height = 20, width = 15)
+p <- FeaturePlot(NkT_seurat, features =  c("FCGR3A","NCAM1"), pt.size = 0.5, blend = F,keep.scale = "all",
+            #cols = c("FCGR3A" = "red", "NCAM1" = "blue"), 
+            combine = T,
+            split.by = "RNA_snn_res.0.4"
+            )
+ggsave(plot = p, filename = "./results/Cell proportion/Featureplot.pdf", height = 20, width = 20)
+NkT_seurat@meta.data <- NkT_seurat@meta.data %>% 
+  mutate(Group = ifelse(grepl("N", sampleid), "N", "T"))
+p <- DoHeatmap(NkT_seurat, 
+          features = c("FCGR3A","NCAM1"), 
+          group.by = "Group",
+          slot = "data", 
+          group.bar = T) +
+  scale_fill_gradientn(colors = c("white","grey","firebrick3"))
+ggsave(plot = p, filename = "./results/Cell proportion/heatmap_dim_bright_NT.pdf", width = 9)
+p <- DoHeatmap(NkT_seurat, 
+          features = c("FCGR3A","NCAM1"), 
+          group.by = "sampleid",
+          slot = "data", 
+          group.bar = T) +
+  scale_fill_gradientn(colors = c("white","grey","firebrick3"))
+ggsave(plot = p, filename = "./results/Cell proportion/heatmap_dim_bright_25NT.pdf", width = 9)
+```
