@@ -216,7 +216,6 @@ enrichtment_tidydata <- function(DEG_lis, CachePath){
   purrr::map_depth(1, function(.x){
     .x[sapply(.x, \(.x) length(.x) != 0)]
   })
-saveRDS(enrichment.res_list, paste0(CachePath, "enrichment.res.RDs"))
 enrichment.res_list <- 
   list(UP = enrichment.res_list %>% 
          lapply(\(.x){
