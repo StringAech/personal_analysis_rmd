@@ -1,5 +1,5 @@
 ---
-title: "YKKY0081"
+title: "YKKY0081天津胸科医院-个性化"
 author: "GuoHao"
 date: "2024/3/6"
 output: html_document
@@ -41,6 +41,10 @@ suppressPackageStartupMessages(library(survival))
 suppressPackageStartupMessages(library(survminer))
 suppressPackageStartupMessages(library(CellChat))
 suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(SpatialDecon))
+suppressPackageStartupMessages(library(RColorBrewer))
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
 setwd("~/work/DSP/YKKY0081天津胸科医院/DSP_WTA")
 # default parameter
 Work_canche_dir <- "./personal_analysis/rmd_Results/"
@@ -199,14 +203,157 @@ output_intersection <- function(intersecion_set, file){
   return(intersecion_set)
   
 }
+
+enrichtment_tidydata <- function(DEG_lis, CachePath){
+  enrichment.res_list <- DEG_list %>% 
+  purrr::map_depth(3, function(.x){
+    rownames(.x) %>% 
+      enrichKEGG.function(qvalueCutoff = 1, pvalueCutoff = 1)
+  }) %>% # del the null list
+  purrr::map_depth(2, function(.x){
+    .x[!sapply(.x, \(.x) is.null(.x))]
+  }) %>% 
+  purrr::map_depth(1, function(.x){
+    .x[sapply(.x, \(.x) length(.x) != 0)]
+  })
+saveRDS(enrichment.res_list, paste0(CachePath, "enrichment.res.RDs"))
+enrichment.res_list <- 
+  list(UP = enrichment.res_list %>% 
+         lapply(\(.x){
+           purrr::map(.x, ~ .x[["UP"]])
+         }) %>% # del the null list
+         purrr::map_depth(1, function(.x){
+           .x[sapply(.x, \(.x) length(.x) != 0)]
+         }),
+       DOWN = enrichment.res_list %>% 
+         lapply(\(.x){
+           purrr::map(.x, ~ .x[["DOWN"]])
+         }) %>% # del the null list
+         purrr::map_depth(1, function(.x){
+           .x[sapply(.x, \(.x) length(.x) != 0)]
+         })
+  ) %>% 
+  purrr::map_depth(3, function(.x) .x@result)
+return(enrichment.res_list)
+}
+### DSP_FindAllMarker
+source("~/script/Rscript/DSP_FindAllMarker.r")
+### Part V
+mean_Patient <- function(meandata, object = exp_group_object){
+  exp <- aggregate(meandata[, 12:ncol(meandata)], by=list(meandata$TMA.position),mean) #计算同一病人不同AOI的均值
+  rownames(exp) <- exp[,1]
+  exp <- exp[,-1]
+  data <- object
+  data@exp <- t(exp)
+  data@anno <- meandata[, 1:11] %>% distinct(TMA.position, .keep_all = T)
+  rownames(data@anno) <- data@anno$TMA.position
+  data@anno$OS <- strsplit(data@anno$PFS_OS, " OS") %>% Reduce(rbind,.) %>% 
+    as.data.frame() %>% .[,2]
+  data@anno$DFS <- strsplit(data@anno$PFS_OS, " OS") %>% Reduce(rbind,.) %>% 
+    as.data.frame() %>% .[,1]
+  data@anno["08-1012-2",c("OS","DFS")] <- c("175","172.8")
+  data@anno$OS <- data@anno$OS %>% gsub(pattern = " ",replacement = "")
+  data@anno$DFS <- data@anno$DFS %>% gsub(pattern = "DFS ",replacement = "") %>% 
+    gsub(pattern = "DFS",replacement = "")
+  data@anno["18-2116-4","DFS"] <- "54.8"
+  data@anno$Status <- data@anno$Status %>% gsub(pattern = "未复发",replacement = "0") %>% 
+    gsub(pattern = "复发",replacement = "1") %>% as.numeric()
+  data@anno$OS <- as.numeric(data@anno$OS)
+  data@anno$DFS <- as.numeric(data@anno$DFS)
+  return(data)
+}
+log_P <- function(data, intersect_gene = all_intersect_gene){
+  # browser()
+  exp <- data@exp %>% 
+    t() %>% 
+    as.data.frame() %>% 
+    dplyr::select(unlist(intersect_gene) %>% as.character() %>% unique())
+  anno <- data@anno %>% 
+    dplyr::select(DFS, Status)
+  cal_data <- merge(anno, exp, by = 0) %>% 
+    column_to_rownames("Row.names")
+  phe <- cal_data[, 1:2]
+  mySurv <- with(cal_data, Surv(DFS, Status))
+  exprSet <- cal_data[, -c(1:2)] %>% t
+  log_rank_p <- apply(exprSet, 1 , function(gene){
+    # gene=exprSet[1,]
+    phe$group <- ifelse(gene > median(gene), 'high', 'low')  
+    data.survdiff <- survdiff(mySurv ~ group, data = phe)
+    p.val = 1 - pchisq(data.survdiff$chisq, length(data.survdiff$n) - 1)
+    return(p.val)
+  })
+  log_rank_p <- sort(log_rank_p)
+  # table(log_rank_p < 0.05)
+  sig_gene <- log_rank_p[log_rank_p < 0.05] %>% names()
+  return(sig_gene)
+}
+SurPlot <- function(data, sig_gene, listnames = "TC", CachePath) {
+  # browser()
+  exprSet <- data[[listnames]]@exp %>%
+    as.data.frame() %>%
+    dplyr::filter(rownames(.)  %in% sig_gene[[listnames]]) %>%
+    as.matrix()
+  rownames(exprSet) <-
+    gsub(rownames(exprSet),
+         pattern = "-",
+         replacement = "_")
+  # phe <- data[[listnames]]@anno %>%
+  #   dplyr::select(DFS, Status)
+  for (g in gsub("-", "_", sig_gene[[listnames]])) {
+    phe <- data[[listnames]]@anno %>%
+      dplyr::select(DFS, Status)
+    phe <- phe %>%
+      dplyr::mutate(!!sym(g) := ifelse(exprSet[g,] > median(exprSet[g,]), 'high', 'low'))
+    print(g)
+    # a <- as.formula(paste0("Surv(DFS, Status) ~ ", g))
+    # sfit1 <- survfit(!!a, data = phe)
+    formula_str <- paste("Surv(DFS, Status)", g, sep = " ~ ")
+    formula_str <- as.formula(formula_str)
+    sfit1 <- survfit(formula_str, data = phe)
+    sfit1[["call"]][["formula"]] <- formula_str
+    print(sfit1[["call"]][["formula"]])
+    p <-
+      ggsurvplot(sfit1,
+                 pval = TRUE,
+                 data = phe,
+                 risk.table = TRUE)
+    pdf(file = paste0(CachePath, g, "_survplot.pdf"),
+        onefile = F)
+    print(p)
+    dev.off()
+  }
+}
+DSP_subset <- function(object, patter = NULL){
+  object@anno <- object@anno %>% 
+    dplyr::filter(!!rlang::parse_expr(patter))
+  object@raw_exp <- object@raw_exp %>% 
+    as.data.frame() %>% 
+    dplyr::select(all_of(rownames(object@anno))) %>% as.matrix()
+  object@exp <- object@exp %>% 
+    as.data.frame() %>% 
+    dplyr::select(all_of(rownames(object@anno))) %>% as.matrix()
+  return(object)
+}
+SpatialDecon_summary <- function(object){
+  per.observation.mean.neg <- object@exp["NegProbe-WTX", ]
+  bg <-  sweep(object@exp * 0, 2, per.observation.mean.neg, "+")
+  bg2 <- derive_GeoMx_background(norm = object@exp,
+                                 probepool = rep(1, nrow(object@exp)),
+                                 negnames = "NegProbe-WTX")
+  res <- spatialdecon(norm = object@exp, bg = bg, X = safeTME,
+                      cell_counts = object@anno$AOINucleiCount,
+                      # cellmerges = safeTME.matches, # 是否合并成大类
+                      # is_pure_tumor = object@anno$Tumor == "TRUE",
+                      align_genes = TRUE)
+  return(res)
+}
 ```
 
 ## 样本信息
 
 ### 分组
 
-Group1: 
-Group2: 
+Group1: 恶性程度从低到高：贴壁型（LPA）、腺泡型（APA）、乳头型（PPA）、复杂腺体型（CAA）、实性型（SPA）、微乳头型（MPA） Group2: 预后分组：预后好 vs 预后差 \#\#\# 分析需求 以下所有分析去掉1个AOI（16-2060-1-MPA-BY-Full）
 
 ```{r del.the.sample}
 ## load the raw data, the data neet to del the sample
@@ -398,7 +545,7 @@ plotdata <- exp_group_object@exp %>%
   merge(exp_group_object@anno %>% 
           dplyr::select(Morphology, Sample, CancerType), by = 0, sort = F) %>% 
   rename(SampleID = Row.names) %>% 
-  mutate(PanCK = (KRT8+KRT19)/2) %>% # 只能找到这两个基因, 大抵是呗过滤掉了
+  mutate(PanCK = (KRT8+KRT19)/2) %>% # 只能找到这两个基因, 大抵是被过滤掉了
   dplyr::select(-KRT19, -KRT8) %>% 
   dplyr::select(1, 4, 5, 6, everything()) %>% 
   pivot_longer(cols = -colnames(.)[1:4], names_to = "Marker_names", values_to = "Marker_value")
@@ -423,12 +570,11 @@ lapply(unique(plotdata$Marker_names), function(.x){
 CachePath <- paste0(Work_canche_dir, "Part II/2.1 differential gene/")
 PlotsPath <- paste0(Work_canche_dir, "Part II/2.1 differential gene/")
 create_dir(path.list = c(CachePath, PlotsPath))
-exp_group_object@deg_groups <- c("CancerType(LPA:PPA),Prognosis$bad&Morphology$M1; CancerType(LPA:CAA),Prognosis$bad&Morphology$M1; CancerType(LPA:SPA),Prognosis$bad&Morphology$M1; CancerType(LPA:MPA),Prognosis$bad&Morphology$M1; CancerType(LPA:APA),Prognosis$bad&Morphology$M2; CancerType(LPA:CAA),Prognosis$bad&Morphology$M2; CancerType(LPA:SPA),Prognosis$bad&Morphology$M2; CancerType(LPA:MPA),Prognosis$bad&Morphology$M2; CancerType(LPA:APA),Prognosis$bad&Morphology$TC; CancerType(LPA:PPA),Prognosis$bad&Morphology$TC; CancerType(LPA:CAA),Prognosis$bad&Morphology$TC; CancerType(LPA:SPA),Prognosis$bad&Morphology$TC; CancerType(LPA:MPA),Prognosis$bad&Morphology$TC")
-
+exp_group_object@deg_groups <- c("CancerType(LPA:PPA),Morphology$M1; CancerType(LPA:CAA),Morphology$M1; CancerType(LPA:SPA),Morphology$M1; CancerType(LPA:MPA),Morphology$M1; CancerType(LPA:APA),Morphology$M2; CancerType(LPA:CAA),Morphology$M2; CancerType(LPA:SPA),Morphology$M2; CancerType(LPA:MPA),Morphology$M2; CancerType(LPA:APA),Morphology$TC; CancerType(LPA:PPA),Morphology$TC; CancerType(LPA:CAA),Morphology$TC; CancerType(LPA:SPA),Morphology$TC; CancerType(LPA:MPA),Morphology$TC")
 source("~/script/Rscript/Parallel script/library_EPARS_parallel.r")
 exp_group_object <- parallel_DEG(exp_group_object, CachePath = "./personal_analysis/rmd_Results/Part II/2.1 differential gene/DEG_res/", core.num = 6)
 
-parallel_heatmap(exp_group_object, CachePath = "./personal_analysis/rmd_Results/Part II/2.1 differential gene/DEG_res/heatmap//", PlotsPath = "./personal_analysis/rmd_Results/Part II/2.1 differential gene/DEG_res/heatmap//", core.num = 6)
+parallel_heatmap(exp_group_object, CachePath = "./personal_analysis/rmd_Results/Part II/2.1 differential gene/DEG_res/heatmap/", PlotsPath = "./personal_analysis/rmd_Results/Part II/2.1 differential gene/DEG_res/heatmap//", core.num = 6, top = 10)
 
 parallel_volcano(exp_group_object, PlotsPath = "./personal_analysis/rmd_Results/Part II/2.1 differential gene/DEG_res/volcano_lplot/")
 
@@ -436,7 +582,8 @@ parallel_volcano(exp_group_object, PlotsPath = "./personal_analysis/rmd_Results/
 exp_list <- exp_group_object@deg %>% 
   lapply(\(.x){.x@result_df}) %>% 
   lapply(\(.x){
-    .x %>% dplyr::filter(change != "NOT") %>% rownames()
+    .x %>% dplyr::filter(change != "NOT")  %>% 
+      split(f = .$change)
   }) %>% 
   .[sapply(., \(.x) length(.x) != 0)] %>% 
   .[!grepl("^Pro", names(.))]
@@ -478,12 +625,16 @@ lapply(names(DEG_list), \(.x){
 发现这三个基因会在除SPA, MPA的亚型中是上升趋势.
 
 ```{r 3gene boxplot}
+time.point <- c("LPA", "APA", "PPA", "CAA", "SPA", "MPA")
+exp_group_object@anno$CancerType <- factor(exp_group_object@anno$CancerType, levels = time.point)
 exp <- exp_group_object@exp %>% 
   as.data.frame() %>% 
-  filter(rownames(.) %in% c("CDC25B", "CH25H", "SMAD1")) %>% t
+  filter(rownames(.) %in% c("TMEM221", "XAGE1A")) %>% t
+anno <- exp_group_object@anno %>% 
+  dplyr::select(CancerType)
 exp <- merge(anno, exp, by = 0) %>%
   dplyr::select(-1) %>% 
-  summarise(across(everything(), mean), .by = CancerType) %>% 
+  dplyr::summarise(across(everything(), mean), .by = CancerType) %>% 
   pivot_longer(cols = -CancerType)  
 exp$CancerType <- factor(exp$CancerType, levels = time.point)
 p <- ggline(exp, x = "CancerType", y = "value", color = "name") 
@@ -518,43 +669,62 @@ ggsave(filename = paste0(Work_plot_dir, "Part II/all_gene_boxplot.pdf"), plot = 
 CachePath <- paste0(Work_canche_dir, "Part II/2.2 Enrichment analysis/")
 PlotsPath <- paste0(Work_canche_dir, "Part II/2.2 Enrichment analysis/")
 create_dir(path.list = c(CachePath, PlotsPath))
-enrichment.res_list <- lapply(DEG_list, function(.x){
- .x <- lapply(.x, \(..x){
-    enrichKEGG.function(..x, qvalueCutoff = 1, pvalueCutoff = 1) %>% 
-     as.data.frame()
+enrichment.res_list <- DEG_list %>% 
+  purrr::map_depth(3, function(.x){
+    rownames(.x) %>% 
+      enrichKEGG.function(qvalueCutoff = 1, pvalueCutoff = 1)
+  }) %>% # del the null list
+  purrr::map_depth(2, function(.x){
+    .x[!sapply(.x, \(.x) is.null(.x))]
+  }) %>% 
+  purrr::map_depth(1, function(.x){
+    .x[sapply(.x, \(.x) length(.x) != 0)]
   })
-})
 saveRDS(enrichment.res_list, paste0(CachePath, "enrichment.res.RDs"))
 enrichment.res_list <- readRDS("~/work/DSP/YKKY0081天津胸科医院/DSP_WTA/personal_analysis/rmd_Results/Part II/2.2 Enrichment analysis/enrichment.res.RDs")
-TC_enrich_res <- enrichment.res_list$TC_list %>% 
-  lapply(\(.x) {
-    .x <- .x %>% dplyr::filter(pvalue < 0.05)
-    .x <- .x$ID
-  }) %>% Reduce(append, .) %>% unique()
-
+enrichment.res_list <- 
+  list(UP = enrichment.res_list %>% 
+            lapply(\(.x){
+            purrr::map(.x, ~ .x[["UP"]])
+            }) %>% # del the null list
+            purrr::map_depth(1, function(.x){
+              .x[sapply(.x, \(.x) length(.x) != 0)]
+            }),
+          DOWN = enrichment.res_list %>% 
+            lapply(\(.x){
+              purrr::map(.x, ~ .x[["DOWN"]])
+            }) %>% # del the null list
+            purrr::map_depth(1, function(.x){
+              .x[sapply(.x, \(.x) length(.x) != 0)]
+            })
+          ) %>% 
+  purrr::map_depth(3, function(.x) .x@result)
 plot.data <- enrichment.res_list %>% 
-  lapply(\(.x){
-    .x <- .x %>% 
-      do.call(rbind, .) %>% 
+  purrr::map_depth(2, function(.x){
+    do.call(rbind, .x) %>% 
       rownames_to_column("Group") %>% 
       mutate(Group = str_extract(Group, ".*(?=\\.)")) %>% 
       group_by(Group) %>% # 保存表格注释掉
       slice_min(p.adjust, n = 5) %>% # 这里取了每个组中矫正p值前5位 # 保存表格注释掉
       # 在画图之前, 先保存字符形式的Ratio
       mutate(GeneRatio = trans2num(GeneRatio), BgRatio = trans2num(BgRatio)) # 保存表格注释掉
-    return(.x)
   })
-write.xlsx(plot.data, 
-           file = paste0(CachePath, "enrichment.results.xlsx"),
-           overwrite = T)
-lapply(names(plot.data), function(.x){
-  print(.x)
-  dir <- paste0(CachePath, .x, "/")
-  dir.create(dir, recursive = T)
-  p <- dotplot.function(plot.data[[.x]])
-  ggsave(filename = paste0(dir, "dotplot.pdf"), height = 20, width = 10, plot = p)
+lapply(names(plot.data), \(.x){
+  lapply(names(plot.data[[.x]]), \(..x){
+    dir <- paste0(CachePath, "DEG/Prognosis_enrichment_res/", .x, "/", ..x, "/")
+    dir.create(dir, recursive = T, showWarnings = F)
+    write.xlsx(plot.data[[.x]][[..x]], file = paste0(dir, "enrichment.results.xlsx"))
+  })
 })
-
+lapply(names(plot.data), function(.x){
+  lapply(names(plotdata[[.x]]), \(..x){
+    print(..x)
+    dir <- paste0(CachePath, .x, "/", ..x, "/")
+    dir.create(dir, recursive = T)
+    p <- dotplot.function(plot.data[[.x]][[..x]])
+    ggsave(filename = paste0(dir, "dotplot.pdf"), height = 20, width = 10, plot = p)
+  })
+})
 ```
 
 ### 2.3 Use SCORPIUS to simulate developmental trajectories
@@ -580,11 +750,14 @@ ggsave(filename = paste0(Work_plot_dir, "Part II/2.3 SCORPIUS/developmental traj
 
 ### 3.1 SpatialDecon immune cells
 
+#### 3.1.2 all sample immune cells analysis
+
+This chunk to analysis immunoinfiltration use all sample.
+
 ```{r SpatialDecon}
 CachePath <- paste0(Work_canche_dir, "Part III/")
 PlotsPath <- paste0(Work_canche_dir, "Part III/")
 create_dir(path.list = c(CachePath, PlotsPath))
-library(SpatialDecon)
 per.observation.mean.neg <- exp_group_object@exp["NegProbe-WTX", ]
 bg <-  sweep(exp_group_object@exp * 0, 2, per.observation.mean.neg, "+")
 bg2 <- derive_GeoMx_background(norm = exp_group_object@exp,
@@ -595,19 +768,46 @@ res <- spatialdecon(norm = exp_group_object@exp, bg = bg, X = safeTME,
                     # cellmerges = safeTME.matches, # 是否合并成大类
                     # is_pure_tumor = object@anno$Tumor == "TRUE",
                     align_genes = TRUE)
+saveRDS(res, file = paste0(CachePath, "3.1 immune cells/spatialdecon.res.abundance.RDs"))
 write.xlsx(res$beta %>% as.data.frame(),
            file = paste0(CachePath, "3.1 immune cells/spatialdecon.res.abundance.xlsx"), 
-           rowNames = T)
+           rowNames = T, overwrite = T)
 
+### del the CAA sample
+exp_group_object_partIII <- exp_group_object
+exp_group_object_partIII@anno <- exp_group_object_partIII@anno %>% 
+  dplyr::filter(CancerType != "CAA")
+exp_group_object_partIII@exp <- exp_group_object_partIII@exp %>% 
+  as.data.frame() %>% 
+  dplyr::select(rownames(exp_group_object_partIII@anno)) %>% 
+  as.matrix()
+exp_group_object_partIII@raw_exp <- exp_group_object_partIII@raw_exp %>% 
+  as.data.frame() %>% 
+  dplyr::select(rownames(exp_group_object_partIII@anno)) %>% 
+  as.matrix()
+
+per.observation.mean.neg <- exp_group_object_partIII@exp["NegProbe-WTX", ]
+bg <-  sweep(exp_group_object_partIII@exp * 0, 2, per.observation.mean.neg, "+")
+bg2 <- derive_GeoMx_background(norm = exp_group_object_partIII@exp,
+                               probepool = rep(1, nrow(exp_group_object_partIII@exp)),
+                               negnames = "NegProbe-WTX")
+res <- spatialdecon(norm = exp_group_object_partIII@exp, bg = bg, X = safeTME,
+                    cell_counts = exp_group_object_partIII@anno$AOINucleiCount,
+                    # cellmerges = safeTME.matches, # 是否合并成大类
+                    # is_pure_tumor = object@anno$Tumor == "TRUE",
+                    align_genes = TRUE)
+write.xlsx(res$beta %>% as.data.frame(),
+           file = paste0(CachePath, "3.1 immune cells/del_CAA/spatialdecon.res.abundance.xlsx"), 
+           rowNames = T, overwrite = T)
 ```
 
 ```{r plot}
 exp_group_object@heatmap_groups <- c("CancerType", "SegmentLabel")
-exp_group_object@anno$CancerType <- factor(exp_group_object@anno$CancerType)
+exp_group_object@anno$CancerType <- factor(exp_group_object@anno$CancerType, levels = time.point)
 exp_group_object@anno$SegmentLabel <- factor(exp_group_object@anno$SegmentLabel)
 exp_group_object <- epars_plot_setting(exp_group_object)
 exp_group_object <- epars_heatmap_anno_data(exp_group_object)
-ordersample <- rownames(arrange(exp_group_object@anno, CancerType))
+ordersample <- rownames(dplyr::arrange(exp_group_object@anno, CancerType))
 # abundance 
 p <- Heatmap(matrix = res$beta %>% scale(), 
         top_annotation = exp_group_object@plot_setting$heatmap_anno, 
@@ -623,7 +823,7 @@ Cancertype.abundance <- res$beta %>%
   merge(exp_group_object@anno %>% dplyr::select(CancerType), ., by = 0) %>% 
   column_to_rownames("Row.names") %>% 
   group_by(CancerType) %>% 
-  summarise(across(everything(), sum)) %>% 
+  dplyr::summarise(dplyr::across(everything(), sum)) %>% 
   column_to_rownames("CancerType") %>% 
   apply(1, \(.x) .x/sum(.x)) %>% 
   as.data.frame() %>% 
@@ -632,6 +832,9 @@ Cancertype.abundance <- res$beta %>%
 suppressPackageStartupMessages(library(RColorBrewer))
 qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
 col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+
+Cancertype.abundance$CancerType <- factor(Cancertype.abundance$CancerType, levels = time.point)
+  
 p <- Cancertype.abundance %>% 
   ggplot(aes(x = CancerType, y = Cell.Proportion)) + 
   geom_col(aes(fill = CellType)) + 
@@ -659,10 +862,163 @@ adjusted_boxplot_nojitter(input_df = plotdata,
                           plot_dir = paste0(CachePath, "3.1 immune cells/boxplot/"),
                           plot_suffix = ".abundance.boxplot.pdf", 
                           comparisons_list = combn(unique(plotdata$CancerType), 2, simplify = F), 
-                          x_order = unique(plotdata$CancerType), 
+                          x_order = time.point, 
                           plot_width = 25, 
                           ncol = 6,
                           # stat_method = "t.test", 
+                          adjust_method = "BH")
+```
+
+```{r plot_del_CAA}
+time.point <- c("LPA", "APA", "PPA", "SPA", "MPA")
+exp_group_object_partIII@heatmap_groups <- c("CancerType", "SegmentLabel")
+exp_group_object_partIII@anno$CancerType <- factor(exp_group_object_partIII@anno$CancerType, levels = time.point)
+exp_group_object_partIII@anno$SegmentLabel <- factor(exp_group_object_partIII@anno$SegmentLabel)
+exp_group_object_partIII <- epars_plot_setting(exp_group_object_partIII)
+exp_group_object_partIII <- epars_heatmap_anno_data(exp_group_object_partIII)
+ordersample <- rownames(dplyr::arrange(exp_group_object_partIII@anno, CancerType))
+# abundance 
+p <- Heatmap(matrix = res$beta %>% scale(), 
+        top_annotation = exp_group_object_partIII@plot_setting$heatmap_anno, 
+        cluster_columns = F, column_order = ordersample,
+        heatmap_legend_param = list(title = "",legend_height = unit(4, "cm")),
+        column_split = exp_group_object_partIII@plot_setting$group_df[, "SegmentLabel"])
+save_pdf(p, 
+         filename = paste0(CachePath, "3.1 immune cells/del_CAA/SpatialDecon.immcell.abundance.heatmap.pdf"), 
+         height = 12, width = 12)
+Cancertype.abundance <- res$beta %>% 
+  as.data.frame() %>% 
+  t() %>% 
+  merge(exp_group_object_partIII@anno %>% dplyr::select(CancerType), ., by = 0) %>% 
+  column_to_rownames("Row.names") %>% 
+  group_by(CancerType) %>% 
+  dplyr::summarise(dplyr::across(everything(), sum)) %>% 
+  column_to_rownames("CancerType") %>% 
+  apply(1, \(.x) .x/sum(.x)) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("CellType") %>% 
+  pivot_longer(cols = -CellType, names_to = "CancerType", values_to = "Cell.Proportion")
+
+Cancertype.abundance$CancerType <- factor(Cancertype.abundance$CancerType, levels = time.point)
+  
+p <- Cancertype.abundance %>% 
+  ggplot(aes(x = CancerType, y = Cell.Proportion)) + 
+  geom_col(aes(fill = CellType)) + 
+  scale_fill_manual(values = col_vector) + 
+  ylab("Cell Proportion")
+ggsave(plot = p, filename = paste0(CachePath,"3.1 immune cells/del_CAA/SpatialDecon.immcell.proportion.pdf"), 
+       height = 12, width = 12)
+#### 
+# 经过检查, monocytes.C 这个在某些亚型中丰度为0
+#### 
+
+#### immcell abundance boxplot ####
+plotdata <- res$beta %>% 
+  as.data.frame() %>% 
+  t() %>% 
+  merge(exp_group_object_partIII@anno %>% dplyr::select(CancerType), ., by = 0) %>% 
+  dplyr::select(-monocytes.C)
+
+plotdata$CancerType <- plotdata$CancerType %>% as.character()
+suppressWarnings(source("~/script/Rscript/all.function.R"))
+
+adjusted_boxplot_nojitter(input_df = plotdata, 
+                          id_colnames = colnames(plotdata)[1:2], 
+                          x_aes = colnames(plotdata)[2], 
+                          plot_dir = paste0(CachePath, "3.1 immune cells/del_CAA/boxplot/"),
+                          plot_suffix = ".abundance.boxplot.pdf", 
+                          comparisons_list = combn(unique(plotdata$CancerType), 2, simplify = F), 
+                          x_order = time.point, 
+                          plot_width = 25, 
+                          ncol = 6,
+                          # stat_method = "t.test", 
+                          adjust_method = "BH")
+rm(p, plotdata, res, bg2, bg, exp_group_object_partIII, Cancertype.abundance)
+```
+
+#### 3.1.3 Immunoinflitration of diiffernet prognostic samples
+
+This chunk analysis immunoinfiltration of different prognositc samples
+
+```{r prepare_the_data}
+# CachePath <- paste0(Work_canche_dir, "Part III/3.1 immune cells/different_prognositc/")
+# PlotsPath <- paste0(Work_canche_dir, "Part III/3.1 immune cells/different_prognositc/")
+# create_dir(path.list = c(CachePath, PlotsPath))
+
+# object_list <- list(Good = DSP_subset(exp_group_object, patter = "Prognosis == 'bad'"), 
+#                     Bad = DSP_subset(exp_group_object, patter = "Prognosis == 'bad'"))
+```
+
+```{r calcultaion_immcellproportion}
+# res <- lapply(object_list, \(.x) SpatialDecon_summary(.x))
+# outputxlsx <- lapply(res, \(.x) as.data.frame(.x$beta))
+# write.xlsx(outputxlsx, 
+#            file = paste0(CachePath, "3.1 immune cells/different_prognositc/SpatialDecon_prognositc_res.xlsx"),
+#            rowNames = T, overwrite = T)
+### There is no need to calculate separately
+res <- readRDS(file = paste0(CachePath, "3.1 immune cells/spatialdecon.res.abundance.RDs"))
+```
+
+```{r plot}
+exp_group_object@heatmap_groups <- c("CancerType", "Prognosis")
+# exp_group_object@anno$CancerType <- factor(exp_group_object@anno$CancerType, levels = time.point)
+exp_group_object@anno$SegmentLabel <- factor(exp_group_object@anno$Prognosis)
+exp_group_object <- epars_plot_setting(exp_group_object)
+exp_group_object <- epars_heatmap_anno_data(exp_group_object)
+ordersample <- rownames(dplyr::arrange(exp_group_object@anno, Prognosis))
+p <- Heatmap(matrix = res$beta %>% scale(), 
+        top_annotation = exp_group_object@plot_setting$heatmap_anno, 
+        cluster_columns = T, #column_order = ordersample,
+        heatmap_legend_param = list(title = "",legend_height = unit(4, "cm")),
+        column_split = exp_group_object@plot_setting$group_df[, "Prognosis"]
+        )
+save_pdf(p, 
+         filename = paste0(CachePath, 
+                           "3.1 immune cells/different_prognositc/SpatialDecon.immcell.abundance.heatmap.pdf"), 
+         height = 12, width = 12)
+
+Cancertype.abundance <- res$beta %>% 
+  as.data.frame() %>% 
+  t() %>% 
+  merge(exp_group_object@anno %>% dplyr::select(Prognosis), ., by = 0) %>% 
+  column_to_rownames("Row.names") %>% 
+  group_by(Prognosis) %>% 
+  dplyr::summarise(dplyr::across(everything(), sum)) %>% 
+  column_to_rownames("Prognosis") %>% 
+  apply(1, \(.x) .x/sum(.x)) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("CellType") %>% 
+  pivot_longer(cols = -CellType, names_to = "Prognosis", values_to = "Cell.Proportion")
+
+p <- Cancertype.abundance %>% 
+  ggplot(aes(x = Prognosis, y = Cell.Proportion)) + 
+  geom_col(aes(fill = CellType)) + 
+  scale_fill_manual(values = col_vector) + 
+  ylab("Cell Proportion")
+ggsave(plot = p, 
+       filename = paste0(CachePath,"3.1 immune cells/different_prognositc/SpatialDecon.immcell.proportion.pdf"), 
+       height = 9, 
+       width = 6)
+
+plotdata <- res$beta %>% 
+  as.data.frame() %>% 
+  t() %>% 
+  merge(exp_group_object@anno %>% dplyr::select(Prognosis), ., by = 0) #%>% 
+  #dplyr::select(-monocytes.C)
+
+plotdata$Prognosis <- plotdata$Prognosis %>% as.character()
+source("~/script/Rscript/all.function.R")
+
+adjusted_boxplot_nojitter(input_df = plotdata, 
+                          id_colnames = colnames(plotdata)[1:2], 
+                          x_aes = colnames(plotdata)[2], 
+                          plot_dir = paste0(CachePath, "3.1 immune cells/different_prognositc/boxplot/"),
+                          plot_suffix = ".abundance.boxplot.pdf", 
+                          comparisons_list = combn(unique(plotdata$Prognosis), 2, simplify = F), 
+                          x_order = c("bad", "good"), 
+                          plot_width = 25, 
+                          ncol = 6,
+                          stat_method = "wilcox.test",
                           adjust_method = "BH")
 ```
 
@@ -696,11 +1052,43 @@ Macrophages.cell <- Cibersort.result %>%
   rownames_to_column("CancerType") %>% 
   pivot_longer(cols = -CancerType, names_to = "Macrophages", values_to = "Proprotion")
 
+Macrophages.cell$CancerType <- factor(Macrophages.cell$CancerType, levels = time.point)
+
 p <- Macrophages.cell %>% 
   ggplot(aes(x = CancerType , y = Proprotion)) + 
   geom_col(aes(fill = Macrophages))
 
 ggsave(plot = p, filename = paste0(CachePath, "3.3 Cibersort/cibersort.Macrophages.Proportion .pdf"))
+```
+
+#### 3.3.1 M1-M2 proportion of different prognositc
+
+```{r cibersort_macrophages}
+Cibersort.result <- read.xlsx(xlsxFile = paste0(CachePath, "3.3 Cibersort/Cibersort.res.absolut.xlsx") ,
+                              rowNames = T)
+Macrophages.cell <- Cibersort.result %>% 
+  as.data.frame() %>% 
+  dplyr::select(starts_with("Macrophages")) %>% 
+  merge(., exp_group_object@anno %>% dplyr::select(Prognosis), by = 0) %>% 
+  dplyr::rename(SampleID = Row.names) %>% 
+  dplyr::group_by(Prognosis) %>% 
+  dplyr::summarise(M0 = sum(`Macrophages.M0`), 
+            M1 = sum(`Macrophages.M1`), 
+            M2 = sum(`Macrophages.M2`)) %>% 
+  column_to_rownames("Prognosis") %>% 
+  apply(1, \(.x) .x/sum(.x)) %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("Prognosis") %>% 
+  pivot_longer(cols = -Prognosis, names_to = "Macrophages", values_to = "Proprotion")
+
+p <- Macrophages.cell %>% 
+  ggplot(aes(x = Prognosis , y = Proprotion)) + 
+  geom_col(aes(fill = Macrophages))
+
+ggsave(plot = p, 
+       filename = paste0(CachePath, "3.3 Cibersort/Prognosis_cibersort.Macrophages.Proportion .pdf"),
+       width = 6, height = 9)
 ```
 
 ## Part IV Macrophage ligand receptor analysis
@@ -750,7 +1138,7 @@ write.xlsx(out.xlsx$plot$data, file = paste0(CachePath, "/cellchat.res.xlsx"))
 
 ### 5.1 Analysis of prognostic related markers
 
-```{r DEG_analysis_etc}
+```{r Prognosis_DEG}
 CachePath <- paste0(Work_canche_dir, "Part V/")
 PlotsPath <- paste0(Work_canche_dir, "Part V/")
 create_dir(path.list = c(CachePath, PlotsPath))
@@ -762,7 +1150,53 @@ exp_group_object <- parallel_DEG(exp_group_object, CachePath = "./personal_analy
 parallel_volcano(exp_group_object, PlotsPath = "./personal_analysis/rmd_Results/Part V/DEG/volcano/")
 parallel_heatmap(exp_group_object, CachePath = "personal_analysis/rmd_Results/Part V/DEG/heatmap/", PlotsPath = "personal_analysis/rmd_Results/Part V/DEG/heatmap/", core.num = 6)
 
+### 预后基因的富集分析
+exp_list <- exp_group_object@deg %>% 
+  lapply(\(.x){.x@result_df}) %>% 
+  lapply(\(.x){
+    .x %>% dplyr::filter(change != "NOT")  %>% 
+      split(f = .$change)
+  }) %>% 
+  .[sapply(., \(.x) length(.x) != 0)]
+
+DEG_list <- list(M1_list =  exp_list[names(exp_list) %>% grep(patter = "M1", value = T)],
+                 M2_list = exp_list[names(exp_list) %>% grep(patter = "M2", value = T)],
+                 TC_list = exp_list[names(exp_list) %>% grep(patter = "TC", value = T)]) %>% 
+  lapply(\(.x) {
+    names(.x) <- names(.x) %>% str_extract(".*(?=\\,)")
+    return(.x)
+  })
+enrichment.res_list <- enrichtment_tidydata(DEG_list, CachePath = paste0(CachePath, "DEG/Prognosis_enrichment_res/"))
+plot.data <- enrichment.res_list %>% 
+  purrr::map_depth(2, function(.x){
+    do.call(rbind, .x) %>% 
+      rownames_to_column("Group") %>% 
+      mutate(Group = str_extract(Group, ".*(?=\\.)")) %>% 
+      group_by(Group) %>% # 保存表格注释掉
+      slice_min(p.adjust, n = 5) %>% # 这里取了每个组中矫正p值前5位 # 保存表格注释掉
+      # 在画图之前, 先保存字符形式的Ratio
+      mutate(GeneRatio = trans2num(GeneRatio), BgRatio = trans2num(BgRatio)) # 保存表格注释掉
+  })
+lapply(names(plot.data), \(.x){
+  dir <- paste0(CachePath, "DEG/Prognosis_enrichment_res/",.x, "/")
+  dir.create(dir, recursive = T, showWarnings = F)
+  write.xlsx(plot.data[[.x]], file = paste0(dir, "enrichment.results.xlsx"))
+})
+
+lapply(names(plot.data), function(.x){
+  lapply(names(plot.data[[.x]]), \(..x){
+    print(..x)
+    dir <- paste0(CachePath, "DEG/Prognosis_enrichment_res/",.x, "/", ..x, "/")
+    dir.create(dir, recursive = T)
+    p <- dotplot.function(plot.data[[.x]][[..x]])
+    ggsave(filename = paste0(dir, "dotplot.pdf"), height = 20, width = 10, plot = p)
+  })
+})
+```
+
+```{r DEG_analysis_etc}
 ### 预后的差异基因
+exp_group_object <- readRDS("~/work/DSP/YKKY0081天津胸科医院/DSP_WTA/personal_analysis/rmd_Results/Part V/DEG/exp_group_object.RDS")
 exp_list <- exp_group_object@deg %>% 
   lapply(\(.x){.x@result_df}) %>% 
   lapply(\(.x){
@@ -822,8 +1256,6 @@ all_intersect_gene
 
 ```{r enrichment_insterect_gene}
 
-
-
 all_instersect_enrichment_res <- 
   lapply(all_intersect_gene, \(.x){
   lapply(.x, \(..x){
@@ -861,70 +1293,99 @@ pblapply(names(plot.data), function(.x){
 logrank test预后真正有影响的基因, 由于没有具体的生存状态, 这里使用DFS和是否复发进行生存分析
 
 ```{r WTA2Sample.expr}
-exp_group_object_advanced <- exp_group_object
-anno <- dplyr::select(exp_group_object@anno,c(38:48),)
+anno <- dplyr::select(exp_group_object@anno, c(38:48),)
 exp <- t(exp_group_object@exp)
 meandata <- cbind(anno,exp)#将病人名称与AOI结合
+meandata <- meandata %>% split(f = .[, "Morphology"])
 #exp <- meandata %>% distinct(Sample,.keep_all = T)#随机选择相同病人的AOI
-exp <- aggregate(meandata[, 12:ncol(meandata)], by=list(meandata$TMA.position),mean) #计算同一病人不同AOI的均值
-rownames(exp) <- exp[,1]
-exp <- exp[,-1]
-exp_group_object_advanced@exp <- t(exp)
-exp_group_object_advanced@anno <- exp_group_object@anno[!duplicated(exp_group_object@anno$TMA.position),]
-rownames(exp_group_object_advanced@anno) <- exp_group_object_advanced@anno$TMA.position
-data <- exp_group_object_advanced
-data@anno$OS <- strsplit(data@anno$PFS_OS, " OS") %>% Reduce(rbind,.) %>% 
-  as.data.frame() %>% .[,2]
-data@anno$DFS <- strsplit(data@anno$PFS_OS, " OS") %>% Reduce(rbind,.) %>% 
-  as.data.frame() %>% .[,1]
-data@anno["08-1012-2",c("OS","DFS")] <- c("175","172.8")
-data@anno$OS <- data@anno$OS %>% gsub(pattern = " ",replacement = "")
-data@anno$DFS <- data@anno$DFS %>% gsub(pattern = "DFS ",replacement = "") %>% 
-  gsub(pattern = "DFS",replacement = "")
-data@anno["18-2116-4","DFS"] <- "54.8"
-data@anno$Status <- data@anno$Status %>% gsub(pattern = "未复发",replacement = "1") %>% 
-  gsub(pattern = "复发",replacement = "0") %>% as.numeric()
-data@anno$OS <- as.numeric(data@anno$OS)
-data@anno$DFS <- as.numeric(data@anno$DFS)
+# exp <- aggregate(meandata[, 12:ncol(meandata)], by=list(meandata$TMA.position),mean) #计算同一病人不同AOI的均值
+# rownames(exp) <- exp[,1]
+# exp <- exp[,-1]
+# exp_group_object_advanced@exp <- t(exp)
+# exp_group_object_advanced@anno <- exp_group_object@anno[!duplicated(exp_group_object@anno$TMA.position),]
+# rownames(exp_group_object_advanced@anno) <- exp_group_object_advanced@anno$TMA.position
+# data <- exp_group_object_advanced
+# data@anno$OS <- strsplit(data@anno$PFS_OS, " OS") %>% Reduce(rbind,.) %>% 
+#   as.data.frame() %>% .[,2]
+# data@anno$DFS <- strsplit(data@anno$PFS_OS, " OS") %>% Reduce(rbind,.) %>% 
+#   as.data.frame() %>% .[,1]
+# data@anno["08-1012-2",c("OS","DFS")] <- c("175","172.8")
+# data@anno$OS <- data@anno$OS %>% gsub(pattern = " ",replacement = "")
+# data@anno$DFS <- data@anno$DFS %>% gsub(pattern = "DFS ",replacement = "") %>% 
+#   gsub(pattern = "DFS",replacement = "")
+# data@anno["18-2116-4","DFS"] <- "54.8"
+# data@anno$Status <- data@anno$Status %>% gsub(pattern = "未复发",replacement = "1") %>% 
+#   gsub(pattern = "复发",replacement = "0") %>% as.numeric()
+# data@anno$OS <- as.numeric(data@anno$OS)
+# data@anno$DFS <- as.numeric(data@anno$DFS)
+data <- lapply(meandata, \(.x){mean_Patient(.x)})
+data[["ST"]]@anno
+data[["ST"]]@anno <- data[["ST"]]@anno[1:4, ]
 ```
 
 ```{r Surv}
-exp <- data@exp %>% 
-  t() %>% 
-  as.data.frame() %>% 
-  dplyr::select(unlist(all_intersect_gene) %>% as.character() %>% unique())
-anno <- data@anno %>% 
-  dplyr::select(DFS, Status)
-cal_data <- merge(anno, exp, by = 0) %>% 
-  column_to_rownames("Row.names")
-phe <- cal_data[, 1:2]
-mySurv <- with(cal_data, Surv(DFS, Status))
-exprSet <- cal_data[, -c(1:3)] %>% t
-log_rank_p <- apply(exprSet, 1 , function(gene){
-  # gene=exprSet[1,]
-  phe$group <- ifelse(gene > median(gene), 'high', 'low')  
-  data.survdiff <- survdiff(mySurv ~ group, data = phe)
-  p.val = 1 - pchisq(data.survdiff$chisq, length(data.survdiff$n) - 1)
-  return(p.val)
-})
-log_rank_p <- sort(log_rank_p)
-table(log_rank_p < 0.05)
-sig_gene <- log_rank_p[log_rank_p < 0.05] %>% names()
+sig_gene <- pblapply(data, log_P, intersect_gene = all_intersect_gene) %>% 
+  lapply(\(.x) append(.x, "SPP1")) %>% 
+  .[sapply(., \(.x) length(.x) != 0)]
+sig_gene$ST <- NULL
+# exp <- data@exp %>% 
+#   t() %>% 
+#   as.data.frame() %>% 
+#   dplyr::select(unlist(all_intersect_gene) %>% as.character() %>% unique())
+# anno <- data@anno %>% 
+#   dplyr::select(DFS, Status)
+# cal_data <- merge(anno, exp, by = 0) %>% 
+#   column_to_rownames("Row.names")
+# phe <- cal_data[, 1:2]
+# mySurv <- with(cal_data, Surv(DFS, Status))
+# exprSet <- cal_data[, -c(1:3)] %>% t
+# log_rank_p <- apply(exprSet, 1 , function(gene){
+#   # gene=exprSet[1,]
+#   phe$group <- ifelse(gene > median(gene), 'high', 'low')  
+#   data.survdiff <- survdiff(mySurv ~ group, data = phe)
+#   p.val = 1 - pchisq(data.survdiff$chisq, length(data.survdiff$n) - 1)
+#   return(p.val)
+# })
+# log_rank_p <- sort(log_rank_p)
+# table(log_rank_p < 0.05)
+# sig_gene <- log_rank_p[log_rank_p < 0.05] %>% names()
 ```
 
-```{r survplot}
+利用logrank, 基因大于中位值的记为high, 低于记为low, 然后利用DFS和Status 构建的生存模型计算的, 挑选所有pvalue小于0.05的基因绘制曲线图
 
-for (g in sig_gene) {
-  phe <- phe %>%
-    dplyr::mutate(!!sym(g) := ifelse(exprSet[g, ] > median(exprSet[g, ]),'high','low'))
-  sfit1 <- survfit(as.formula(paste0("Surv(DFS, Status) ~ ", g)), data = phe)
-  p <- ggsurvplot(sfit1, pval =TRUE, data = phe, risk.table = TRUE)
-  pdf(file = paste0(CachePath, "survplot/", g, "_survplot.pdf"), onefile = F)
-  print(p)
-  dev.off()
-}
-table(phe$SULT1C2)
-table(phe$SOD2)
+```{r survplot}
+lapply(names(data), \(.x){
+  dir <- paste0(CachePath, "survplot/", .x, "/")
+  dir.create(dir, showWarnings = F)
+  SurPlot(data, sig_gene, listnames = .x, CachePath = dir)
+})
+
+
+
+# lapply(names(sig_gene), \(.x){
+#   gene <- sig_gene[[.x]]
+#   dir <- paste0(CachePath, "survplot/", .x, "/")
+#   dir.create(dir, recursive = T, showWarnings = F)
+#   for (g in gene) {
+#   phe <- phe %>%
+#     dplyr::mutate(!!sym(g) := ifelse(exprSet[g, ] > median(exprSet[g, ]),'high','low'))
+#   sfit1 <- survfit(as.formula(paste0("Surv(DFS, Status) ~ ", g)), data = phe)
+#   p <- ggsurvplot(sfit1, pval =TRUE, data = phe, risk.table = TRUE)
+#   pdf(file = paste0(dir, g, "_survplot.pdf"), onefile = F)
+#   print(p)
+#   dev.off()
+# }
+# })
+# 
+# for (g in sig_gene) {
+#   phe <- phe %>%
+#     dplyr::mutate(!!sym(g) := ifelse(exprSet[g, ] > median(exprSet[g, ]),'high','low'))
+#   sfit1 <- survfit(as.formula(paste0("Surv(DFS, Status) ~ ", g)), data = phe)
+#   p <- ggsurvplot(sfit1, pval =TRUE, data = phe, risk.table = TRUE)
+#   pdf(file = paste0(CachePath, "survplot/", g, "_survplot.pdf"), onefile = F)
+#   print(p)
+#   dev.off()
+# }
 ```
 
 ### 5.3 Cell interactions associated with prognosis
@@ -933,9 +1394,9 @@ table(phe$SOD2)
 meta.data_all <- exp_group_object@anno %>%
 dplyr::select(cell_type = Morphology, Prognosis) %>%
 dplyr::filter(cell_type %in% c("M1", "M2", "TC"))
-data.input <- exp_group_object@exp %>%  # data.input need to a martix
+data.input_all <- exp_group_object@exp %>%  # data.input need to a martix
 as.data.frame() %>%
-dplyr::select(rownames(meta.data))
+dplyr::select(rownames(meta.data_all))
 #### input good ###
 data.input <- data.input_all %>%
 as.data.frame() %>%
@@ -1045,4 +1506,187 @@ p <- plotdata %>%
   ylab("")
 ggsave(plot = p, filename = paste0(CachePath, "5.3 cellchat/commom_type_res.pdf"), height = 45, width = 9)
   
+```
+
+#### 5.3.2 Multiple groups are analyzed
+
+这里利用官方对于不同数据集分析的教程进行尝试
+
+```{r allmetadata}
+meta.data_all <- exp_group_object@anno %>%
+dplyr::select(cell_type = Morphology, Prognosis) %>%
+dplyr::filter(cell_type %in% c("M1", "M2", "TC"))
+data.input_all <- exp_group_object@exp %>%  # data.input need to a martix
+as.data.frame() %>%
+dplyr::select(rownames(meta.data_all))
+```
+
+```{r good_group}
+#### input good ####
+data.input <- data.input_all %>%
+as.data.frame() %>%
+dplyr::select(rownames(dplyr::filter(meta.data_all, Prognosis == "good"))) %>%
+as.matrix()
+meta.data <- meta.data_all %>%
+dplyr::filter(Prognosis == "good") %>%
+dplyr::select(-Prognosis)
+cellchat_martix_good <- createCellChat(object = data.input, meta = meta.data, group.by = "cell_type")
+CellChatDB <- CellChatDB.human
+cellchat_martix_good@DB <- CellChatDB
+cellchat_martix_good <- subsetData(cellchat_martix_good)
+cellchat_martix_good <- identifyOverExpressedGenes(cellchat_martix_good)
+cellchat_martix_good <- identifyOverExpressedInteractions(cellchat_martix_good)
+# execution.time = Sys.time() - ptm
+# print(as.numeric(execution.time, units = "secs"))
+# Compute the communication probability and infer cellular communication network
+cellchat_martix_good <- computeCommunProb(cellchat_martix_good, type = "triMean")
+cellchat_martix_good <- filterCommunication(cellchat_martix_good, min.cells = 10)
+cellchat_martix_good <- computeCommunProbPathway(cellchat_martix_good)
+cellchat_martix_good <- aggregateNet(cellchat_martix_good)
+# View(subsetCommunication(cellchat_martix_good))
+ouptfile <- subsetCommunication(cellchat_martix_good)
+write.xlsx(ouptfile, file = paste0(CachePath, "5.3 cellchat/Multiple_groups/5.3_good_cellchat.res.xlsx"))
+saveRDS(cellchat_martix_good, file = paste0(CachePath, "5.3 cellchat/Multiple_groups/5.3_good_cellchat_martix.RDs"))
+# netAnalysis_contribution(cellchat_martix_good, signaling = "WNT")
+pdf(file = paste0(CachePath, "5.3 cellchat/Multiple_groups/5.3_good_cellchat.res.circle.pdf"))
+p <- netVisual_circle(cellchat_martix_good@net$count,  vertex.weight = as.numeric(table(cellchat_martix_good@idents)), weight.scale = T)
+dev.off()
+p <- netVisual_bubble(cellchat_martix_good, remove.isolate = F)
+ggsave(plot = p, paste0(CachePath, "5.3 cellchat/Multiple_groups/5.3_good_cellchat.res.dotplot.pdf"), height = 45, width = 9)
+# out.xlsx <- ggplot_build(p)
+# write.xlsx(out.xlsx$plot$data, file = paste0(CachePath, "5.3 cellchat/Multiple_groups/5.3_good_cellchat.res.xlsx"))
+```
+
+```{r bad_group}
+data.input <- data.input_all %>%
+as.data.frame() %>%
+dplyr::select(rownames(dplyr::filter(meta.data_all, Prognosis == "bad"))) %>%
+as.matrix()
+meta.data <- meta.data_all %>%
+dplyr::filter(Prognosis == "bad") %>%
+dplyr::select(-Prognosis)
+cellchat_martix_bad <- createCellChat(object = data.input, meta = meta.data, group.by = "cell_type")
+
+CellChatDB <- CellChatDB.human
+cellchat_martix_bad@DB <- CellChatDB
+cellchat_martix_bad <- subsetData(cellchat_martix_bad)
+cellchat_martix_bad <- identifyOverExpressedGenes(cellchat_martix_bad)
+cellchat_martix_bad <- identifyOverExpressedInteractions(cellchat_martix_bad)
+# execution.time = Sys.time() - ptm
+# print(as.numeric(execution.time, units = "secs"))
+# Compute the communication probability and infer cellular communication network
+cellchat_martix_bad <- computeCommunProb(cellchat_martix_bad, type = "triMean")
+cellchat_martix_bad <- filterCommunication(cellchat_martix_bad, min.cells = 10)
+cellchat_martix_bad <- computeCommunProbPathway(cellchat_martix_bad)
+cellchat_martix_bad <- aggregateNet(cellchat_martix_bad)
+# View(subsetCommunication(cellchat_martix_bad))
+ouptfile <- subsetCommunication(cellchat_martix_bad)
+write.xlsx(ouptfile, file = paste0(CachePath, "5.3 cellchat/Multiple_groups/5.3_bad_cellchat.res.xlsx"))
+saveRDS(cellchat_martix_bad, file = paste0(CachePath, "5.3 cellchat/Multiple_groups/5.3_bad_cellchat_martix.RDs"))
+# netAnalysis_contribution(cellchat_martix_bad, signaling = "WNT")
+pdf(file = paste0(CachePath, "5.3 cellchat/Multiple_groups/5.3_bad_cellchat.res.circle.pdf"))
+p <- netVisual_circle(cellchat_martix_bad@net$count,  vertex.weight = as.numeric(table(cellchat_martix_bad@idents)), weight.scale = T)
+p
+dev.off()
+p <- netVisual_bubble(cellchat_martix_bad, remove.isolate = F)
+ggsave(plot = p, paste0(CachePath, "5.3 cellchat/Multiple_groups/5.3_bad_cellchat.res.dotplot.pdf"), height = 45, width = 9)
+# out.xlsx <- ggplot_build(p)
+# write.xlsx(out.xlsx$plot$data, file = paste0(CachePath, "5.3 cellchat/Multiple_groups/5.3_bad_cellchat.res.xlsx"))
+
+```
+
+```{r chellchat_Multiple}
+#### merge the cellchat object
+object.list <- list(Good = cellchat_martix_good, Bad = cellchat_martix_bad)
+cellchat <- mergeCellChat(object.list, add.names = names(object.list))
+saveRDS(object.list, file = paste0(CachePath, "5.3 cellchat/Multiple_groups/ellchat_object.list_humanSkin_NL_LS.RDs"))
+saveRDS(cellchat, file = paste0(CachePath, "5.3 cellchat/Multiple_groups/cellchat_merged_humanSkin_NL_LS.RDs"))
+```
+
+###### **5.3.2.1 Compare the total number of interactions and interaction strength**
+
+To answer the question on whether the cell-cell communication is enhanced or not, CellChat compares the total number of interactions and interaction strength of the inferred cell-cell communication networks from different biological conditions.
+
+```{r 5.3.2.1}
+gg1 <- compareInteractions(cellchat, show.legend = F, group = c(1,2))
+gg2 <- compareInteractions(cellchat, show.legend = F, group = c(1,2), measure = "weight")
+p <- gg1 + gg2
+ggsave(plot = p, filename = paste0(CachePath, "5.3 cellchat/Multiple_groups/number and strength barplot.pdf"))
+```
+
+###### 5.3.2.2
+
+Circle plot showing differential number of interactions or interaction strength among different cell populations across two datasets
+
+The differential number of interactions or interaction strength in the cell-cell communication network between two datasets can be visualized using circle plot, where redred (or blueblue) colored edges represent increasedincreased (or decreaseddecreased) signaling in the second dataset compared to the first one.
+
+```{r 5.3.2.2}
+par(mfrow = c(1,2), xpd=TRUE)
+pdf(file = paste0(CachePath, "5.3 cellchat/Multiple_groups/Differential number of interactions.pdf"))
+gg1 <- netVisual_diffInteraction(cellchat, weight.scale = T)
+gg1
+dev.off()
+pdf(file = paste0(CachePath, "5.3 cellchat/Multiple_groups/Differential strength of interactions.pdf"))
+gg2 <- netVisual_diffInteraction(cellchat, weight.scale = T, measure = "weight")
+gg2
+dev.off()
+```
+
+###### 5.3.2.3
+
+```{r 5.3.2.3}
+gg1 <- netVisual_heatmap(cellchat)
+#> Do heatmap based on a merged object
+gg2 <- netVisual_heatmap(cellchat, measure = "weight")
+#> Do heatmap based on a merged object
+p <- gg1 + gg2
+pdf(file = paste0(CachePath, 
+                  "5.3 cellchat/Multiple_groups/Differential strength(number) of interactions.pdf"), width = 12)
+p
+dev.off()
+
+```
+
+## Part VI
+
+### Find all marker in the CancerType
+
+```{r find_marker}
+exp_group_object_VI <- DSP_FindAllMarker(exp_group_object, 
+                                         ident_col = "CancerType", 
+                                         CachePath = "./personal_analysis/rmd_Results/Part VI/")
+exp_group_object_VI@anno$Morphology <- factor(exp_group_object_VI@anno$Morphology, 
+                                              levels = c("M1", "M2", "TC", "ST"))
+parallel_heatmap(exp_group_object_VI, CachePath = "./personal_analysis/rmd_Results/Part VI/", PlotsPath = "./personal_analysis/rmd_Results/Part VI/Heatmap/", core.num = 1, top = 20, order_str = "Morphology")
+
+DEGlist <- exp_group_object_VI@deg %>% 
+  lapply(\(.x){.x@result_df}) %>% 
+  lapply(\(.x){
+    .x %>% dplyr::filter(change == "UP")  %>% 
+      slice_min(FDR, n = 10) %>% 
+      rownames()
+  }) %>% 
+  .[sapply(., \(.x) length(.x) != 0)] %>% 
+  unlist() %>% 
+  unique()
+exp <- exp_group_object@exp %>% 
+  as.data.frame() %>% 
+  dplyr::filter(rownames(.)  %in% DEGlist)
+anno <- exp_group_object@anno %>% 
+  dplyr::select(CancerType, Morphology, Prognosis)
+
+# plotdata <- merge(anno, t(exp), by = 0, sort = F)
+anno$CancerType <- factor(anno$CancerType, levels = time.point)
+order_sample <- rownames(arrange(anno, Morphology))
+ha <- HeatmapAnnotation(df = anno)
+p <- Heatmap(scale(exp), 
+        top_annotation = ha, 
+        show_column_names = F, 
+        cluster_columns = F, 
+        column_order = order_sample, 
+        km = 2, 
+        column_split = anno$CancerType, 
+        border = T)
+library(tidyHeatmap)
+save_pdf(p, filename = "./personal_analysis/rmd_Results/Part VI/all_DEGs_Heatmap.pdf", height = 12, width = 12)
 ```
